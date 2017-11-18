@@ -37,6 +37,7 @@ from tensor2tensor.models import resnet
 from tensor2tensor.models import shake_shake
 from tensor2tensor.models import slicenet
 from tensor2tensor.models import transformer
+from tensor2tensor.models import transformer_gan
 from tensor2tensor.models import transformer_moe
 from tensor2tensor.models import transformer_revnet
 from tensor2tensor.models import transformer_sketch
