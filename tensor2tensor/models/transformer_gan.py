@@ -33,11 +33,14 @@ def discriminator(embedded_trans, embedded_context, target_space_id, hparams, re
 
     with tf.variable_scope("discriminator", reuse=reuse):
         with tf.variable_scope("context", reuse=reuse):
-            context_embed = tf.contrib.layers.layer_norm( model_fn_body(embedded_context))
+            context_embed = tf.contrib.layers.layer_norm(model_fn_body(embedded_context))
         with tf.variable_scope("response", reuse=reuse):
             trans_embed = tf.contrib.layers.layer_norm(model_fn_body(embedded_trans))
+    discrim_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='discriminator')
+    clip = [v.assign(tf.clip_by_value(v, -0.01, 0.01)) for v in discrim_vars]
 
-    return tf.sigmoid(tf.reduce_mean(tf.matmul(context_embed, trans_embed, transpose_b=True)))
+    with tf.control_dependencies(clip):
+        return tf.reduce_mean(tf.matmul(context_embed, trans_embed, transpose_b=True))
 
 
 @registry.register_model
@@ -58,8 +61,8 @@ class TransformerGAN(Transformer):
 
         d_real = tf.Print(d_real, [d_real, d_fake])
 
-        d_loss = -tf.reduce_mean(tf.log(d_real + self._hparams.epsilon) + tf.log(1. - d_fake + self._hparams.epsilon))
-        g_loss = -tf.reduce_mean(tf.log(d_fake + self._hparams.epsilon))
+        d_loss = tf.reduce_mean(d_fake - d_real)
+        g_loss = tf.reduce_mean(-d_fake)
 
         losses = dict()
         losses["discriminator"] = d_loss
