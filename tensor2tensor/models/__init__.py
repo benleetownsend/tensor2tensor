@@ -44,4 +44,5 @@ from tensor2tensor.models import transformer_sketch
 from tensor2tensor.models import transformer_vae
 from tensor2tensor.models import vanilla_gan
 from tensor2tensor.models import xception
+from tensor2tensor.models import transformer_adv
 # pylint: enable=unused-import

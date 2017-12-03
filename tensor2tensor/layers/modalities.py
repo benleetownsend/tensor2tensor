@@ -163,7 +163,7 @@ class CTCSymbolModality(SymbolModality):
       logits = tf.squeeze(logits, axis=[2, 3])
       targets_mask = 1 - tf.to_int32(tf.equal(targets, 0))
       targets_lengths = tf.reduce_sum(targets_mask, axis=1)
-      sparse_targets = tf.keras.backend.ctc_label_dense_to_sparse(
+      sparse_targets = tf.contrib.keras.backend.ctc_label_dense_to_sparse(
           targets, targets_lengths)
       xent = tf.nn.ctc_loss(
           sparse_targets,
