@@ -1,3 +1,4 @@
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -17,8 +18,37 @@ import tensorflow as tf
 def reverse_grad(x):
     return tf.stop_gradient(2 * x) - x
 
-def discriminator(embedded_trans, embedded_context,target_space_id,  hparams, reuse=False):
+def reverse_and_reduce_gradient(x, grad_mul=0.01, step_interval=None, warmup=None):
+    warmup = warmup or 0
+    
+    if step_interval is not None:
+        global_step = tf.train.get_or_create_global_step()
+        gating_multiplier = tf.to_float(tf.logical_and(tf.equal(tf.mod(global_step, step_interval), 0), tf.greater(global_step, warmup)))
+        grad_mul *= gating_multiplier
+    
+    return tf.stop_gradient(x + grad_mul * x) - grad_mul * x
+
+#embedding = tf.get_variable("embedding", [34*1024, hparams.hidden_size])
+def soft_embed(x, embedding, batch_size, embed_size, vocab_size):
+    """Softmax x and embed."""
+    x = tf.reshape(x, [-1, vocab_size])
+    x = tf.matmul(x, embedding)
+    return tf.reshape(x, [batch_size, -1, 1, embed_size])
+
+def discriminator(embedded_trans, embedded_context,target_space_id,  hparams, reuse=False):    
     with tf.variable_scope("discriminator", reuse=reuse):
+        #embed_dim = hparams.hidden_size
+        #vocab_size = int(trans.shape[-1])
+        #batch_size = tf.shape(trans)[0]
+        #embedding = tf.get_variable("embedding", shape=[vocab_size, embed_dim])
+        #embedded_trans = soft_embed(trans, embedding, batch_size, embed_dim, vocab_size)
+        #context = tf.squeeze(context, axis=[-1])
+        #embedded_context = tf.gather(embedding, context)
+
+        #        embedded_trans = tf.layers.Dense(trans, embed_dim, name="embedding", reuse=reuse)
+#        embedded_context = tf.layers.Dense(context, embed_dim, name="embedding", reuse=True)
+        
+        
         h0, i0 = common_layers.pad_to_same_length(
             embedded_trans, embedded_context, final_length_divisible_by=16)
         h0 = tf.concat([h0, i0], axis=-1)
@@ -74,30 +104,62 @@ def stop_gradient_dict(d):
 @registry.register_model
 class TransformerGAN(Transformer):
     def model_fn_body(self, features):
+        discrim_features = features["targets"]
+        #with tf.variable_scope(self._problem_hparams.target_modality.name):
+        de_embed_fn = lambda logits: tf.nn.softmax(self._problem_hparams.target_modality.top(logits, None))
         #features = stop_gradient_dict(features)
         """TransformerGAN main model_fn."""
+        embed_dim = self._hparams.hidden_size
+        #feats_with_noise = features.copy()
+        #noise = tf.random_normal(tf.shape(features["inputs"]))
+        #projected_noise = tf.layers.dense(noise, embed_dim, activation=tf.tanh)
+        #feats_with_noise["inputs"] += projected_noise
+
+#        features["targets"] = tf.random_normal(tf.shape(features["targets"]))
+
+        noise = tf.random_uniform(
+            shape=tf.shape(features["targets"]),
+            minval=-0.5,
+            maxval=0.5
+            )
+        
+        noise *= tf.get_variable("noise_bandwidth", dtype=tf.float32, shape=[embed_dim])
+        features["targets"] += noise
+            
         outputs = super(TransformerGAN, self).model_fn_body(features)
         # train = self._hparams.mode == tf.estimator.ModeKeys.TRAIN
 
-        g_sample = outputs
-
         self.hparams.epsilon = 1e-5
+        gsample_embedded = outputs
+        #with tf.variable_scope(tf.VariableScope(False)):
+        #    with tf.variable_scope(self._problem_hparams.target_modality.name):
+        #        g_sample = de_embed_fn(outputs)
+        #        g_sample = tf.squeeze(g_sample, axis=[-2])
+        #        
+#       #         discrim_features = features["targets"]
+        #        discrim_features = de_embed_fn(discrim_features)
+        #        discrim_features = tf.squeeze(discrim_features, axis=[-2])
+        #        smooth_val = self._hparams.gan_label_smoothing
+        #        true_onehot = tf.to_float(tf.one_hot(tf.squeeze(features["targets_raw"], axis=[-1]), tf.shape(discrim_features)[-1]))
+        #        discrim_features = smooth_val * discrim_features + (1 - smooth_val) * true_onehot
+        #        embedd_acc = tf.reduce_mean(tf.to_float(tf.equal(tf.argmax(discrim_features, axis=-1), tf.argmax(true_onehot, axis=-1))))
+#
+#                discrim_features=tf.Print(discrim_features, [embedd_acc])
+            
+#        d_real = discriminator(tf.stop_gradient(discrim_features), features["inputs_raw"], features["target_space_id"],
+#                               self._hparams)
+#        d_fake = discriminator(reverse_and_reduce_gradient(g_sample, self._hparams.discrim_grad_mul, self.hparams.step_interval, self.hparams.warmup_steps), features["inputs_raw"], features["target_space_id"],
+#                               self._hparams, reuse=True)
 
-        discrim_features = features["targets"]
-        discrim_features = tf.stop_gradient(discrim_features) + tf.random_normal(tf.shape(discrim_features), mean=0.0, stddev=0.0001)
-        d_real = discriminator(discrim_features, tf.stop_gradient(features["inputs"]), features["target_space_id"],
-                               self._hparams)
-        d_fake = discriminator(reverse_grad(g_sample), tf.stop_gradient(features["inputs"]), features["target_space_id"],
-                               self._hparams, reuse=True)
-
-#        d_real = tf.Print(d_real, [d_real, d_fake])
+        d_real = discriminator(tf.stop_gradient(discrim_features), tf.stop_gradient(features["inputs"]), features["target_space_id"], self._hparams)
+        d_fake = discriminator(reverse_and_reduce_gradient(gsample_embedded, self._hparams.discrim_grad_mul, self.hparams.step_interval, self.hparams.warmup_steps), tf.stop_gradient(features["inputs"]), features["target_space_id"], self._hparams)
 
         tf.summary.scalar("real_score", tf.reduce_mean(d_real))
         tf.summary.scalar("gen_score", tf.reduce_mean(d_fake))
 
         d_loss = tf.reduce_mean(d_fake - d_real)
         g_loss = tf.stop_gradient(tf.reduce_mean(-d_fake))
-        c_loss = cbow_loss(features["targets"], g_sample)
+        #c_loss = cbow_loss(features["targets"], gsample_embedded)
 
         # WGAN lipschitz-penalty
         alpha = tf.random_uniform(
@@ -105,18 +167,19 @@ class TransformerGAN(Transformer):
                 minval=0.,
                 maxval=1.
         )
-        differences = tf.stop_gradient(g_sample - discrim_features)
-        interpolates = discrim_features + (alpha*differences)
+#        differences = tf.stop_gradient(g_sample - discrim_features)
+        differences = tf.stop_gradient(gsample_embedded - discrim_features)
+        interpolates = tf.stop_gradient(discrim_features) + (alpha*differences)
         gradients = tf.gradients(discriminator(interpolates, tf.stop_gradient(features["inputs"]), features["target_space_id"],
                                                self._hparams, reuse=True), [interpolates])[0]
+        
         slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), reduction_indices=[1,2,3]))
         gradient_penalty = tf.reduce_mean((slopes-1.)**2)
 
         losses = dict()
-        losses["discriminator"] = d_loss
-        losses["generator"] = g_loss
-        losses["lipschitz-penalty"] = gradient_penalty * 100
-        losses["cbow_loss"] = c_loss
+        losses["discriminator"] = d_loss 
+#        losses["generator"] = g_loss
+        losses["lipschitz-penalty"] = gradient_penalty * 1e5
         
         return  outputs, losses
 
@@ -127,15 +190,19 @@ def transformer_gan_base():
     hparams.target_modality="symbol:GAN"
     hparams.batch_size = 1024
     hparams.learning_rate_decay_scheme = "none"
-    hparams.optimizer="SGD"
+    hparams.optimizer="Adam"
     hparams.summarize_grads = True
-    hparams.clip_grad_norm = 10.0
+    hparams.clip_grad_norm = 1000.0
     hparams.add_hparam("num_compress_steps", 2)
+    hparams.add_hparam("discrim_grad_mul", 0.1)
+    hparams.add_hparam("gan_label_smoothing", 1)
+    hparams.add_hparam("step_interval", 10)
+    hparams.add_hparam("warmup_steps", 4000)
     return hparams
 
 
 def decay_gradient(outputs):
-    masking = common_layers.inverse_lin_decay(200000)
+    masking = common_layers.inverse_lin_decay(2500000)
     masking *= common_layers.inverse_exp_decay(50000)  # Not much at start.
     masking = tf.minimum(tf.maximum(masking, 0.0), 1.0)
     tf.summary.scalar("loss_mask", masking)
