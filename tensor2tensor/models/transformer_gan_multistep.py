@@ -140,8 +140,18 @@ class TransformerGAN(Transformer):
         targets = features["targets"]
 
         if not is_training:
-            hparams.num_decode_steps = 1
+            hparams.num_decode_steps = 0
 
+        targets = common_layers.flatten4d3d(targets)
+        decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(
+            targets, hparams)
+
+        outputs_for_MLE = self.decode(decoder_input, encoder_output,
+                              encoder_decoder_attention_bias,
+                              decoder_self_attention_bias, hparams)
+
+        targets = outputs_for_MLE
+        outputs = None
         for _ in range(hparams.num_decode_steps):
             targets = common_layers.flatten4d3d(targets)
             decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(
@@ -150,10 +160,6 @@ class TransformerGAN(Transformer):
             outputs = self.decode(decoder_input, encoder_output,
                                   encoder_decoder_attention_bias,
                                   decoder_self_attention_bias, hparams)
-
-            #with tf.variable_scope(self.hparams.target_modality.name):
-            #    logits = self.hparams.target_modality.top(outputs, None)
-
             targets = outputs
             # TODO (BEN) stop grads???
 
@@ -195,7 +201,7 @@ class TransformerGAN(Transformer):
         losses["discriminator"] = d_loss
         losses["lipschitz-penalty"] = gradient_penalty * 1e5
 
-        return outputs, losses
+        return outputs_for_MLE, losses
 
 
 @registry.register_hparams
