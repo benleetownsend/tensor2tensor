@@ -103,7 +103,34 @@ def stop_gradient_dict(d):
 
 @registry.register_model
 class TransformerGAN(Transformer):
+    def decode(self,
+               decoder_input,
+               encoder_output,
+               encoder_decoder_attention_bias,
+               decoder_self_attention_bias,
+               hparams,
+               cache=None,
+               nonpadding=None):
+        
+        embed_dim = self._hparams.hidden_size
+        noise = tf.random_uniform(
+                        shape=tf.shape(decoder_input),
+                        minval=-0.5,
+                        maxval=0.5
+                        )
+        noise *= tf.get_variable("noise_bandwidth", dtype=tf.float32, shape=[embed_dim])
+        decoder_input += noise
+        
+        return super().decode(decoder_input,
+                       encoder_output,
+                       encoder_decoder_attention_bias,
+                       decoder_self_attention_bias,
+                       hparams,
+                       cache=cache) 
+#                       nonpadding=nonpadding) #required when merged
+    
     def model_fn_body(self, features):
+        features["inputs"] = decay_gradient(features["inputs"])
         discrim_features = features["targets"]
         #with tf.variable_scope(self._problem_hparams.target_modality.name):
         de_embed_fn = lambda logits: tf.nn.softmax(self._problem_hparams.target_modality.top(logits, None))
@@ -117,14 +144,14 @@ class TransformerGAN(Transformer):
 
 #        features["targets"] = tf.random_normal(tf.shape(features["targets"]))
 
-        noise = tf.random_uniform(
-            shape=tf.shape(features["targets"]),
-            minval=-0.5,
-            maxval=0.5
-            )
-        
-        noise *= tf.get_variable("noise_bandwidth", dtype=tf.float32, shape=[embed_dim])
-        features["targets"] += noise
+#        noise = tf.random_uniform(
+#            shape=tf.shape(features["targets"]),
+#            minval=-0.5,
+#            maxval=0.5
+#            )#
+#        
+#        noise *= tf.get_variable("noise_bandwidth", dtype=tf.float32, shape=[embed_dim])
+#        features["targets"] += noise
             
         outputs = super(TransformerGAN, self).model_fn_body(features)
         # train = self._hparams.mode == tf.estimator.ModeKeys.TRAIN
@@ -194,22 +221,24 @@ def transformer_gan_base():
     hparams.summarize_grads = True
     hparams.clip_grad_norm = 1000.0
     hparams.add_hparam("num_compress_steps", 2)
-    hparams.add_hparam("discrim_grad_mul", 0.1)
+    hparams.add_hparam("discrim_grad_mul", 0.01)
     hparams.add_hparam("gan_label_smoothing", 1)
-    hparams.add_hparam("step_interval", 10)
+    hparams.add_hparam("step_interval", 1)
     hparams.add_hparam("warmup_steps", 4000)
     return hparams
 
 
 def decay_gradient(outputs):
-    masking = common_layers.inverse_lin_decay(2500000)
-    masking *= common_layers.inverse_exp_decay(50000)  # Not much at start.
-    masking = tf.minimum(tf.maximum(masking, 0.0), 1.0)
+    masking = common_layers.inverse_lin_decay(500000)
+    masking *= common_layers.inverse_exp_decay(10000)  # Not much at start.
+    masking = tf.minimum(tf.maximum(masking, 0.0), 0.9)
     tf.summary.scalar("loss_mask", masking)
     return tf.stop_gradient(masking * outputs) + (1.0 - masking) * outputs 
 
 @registry.register_symbol_modality("GAN")
 class GANSymbolModality(modalities.SymbolModality):
+    
+    
     def loss(self, *args, **kwargs):
 #        return tf.constant(0.0), tf.constant(0.0)
         loss, weights =  super(GANSymbolModality, self).loss(*args, **kwargs)
