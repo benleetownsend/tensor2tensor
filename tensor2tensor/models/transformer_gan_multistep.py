@@ -139,19 +139,20 @@ class TransformerGAN(Transformer):
 
         targets = features["targets"]
 
-        if not is_training:
-            hparams.num_decode_steps = 0
-
         targets = common_layers.flatten4d3d(targets)
         decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(
             targets, hparams)
 
         outputs_for_MLE = self.decode(decoder_input, encoder_output,
-                              encoder_decoder_attention_bias,
-                              decoder_self_attention_bias, hparams)
+                                      encoder_decoder_attention_bias,
+                                      decoder_self_attention_bias, hparams)
 
         targets = outputs_for_MLE
-        outputs = None
+        if not is_training or hparams.num_decode_steps == 0:
+            hparams.num_decode_steps = 0
+            outputs = outputs_for_MLE
+        else:
+            outputs = None
         for _ in range(hparams.num_decode_steps):
             targets = common_layers.flatten4d3d(targets)
             decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(
