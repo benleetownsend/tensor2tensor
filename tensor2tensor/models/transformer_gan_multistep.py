@@ -17,6 +17,24 @@ def reverse_grad(x):
     return tf.stop_gradient(2 * x) - x
 
 
+def fertility_model(inputs, hparams, train, name, initial_state=None):
+    """Run LSTM cell on inputs, assuming they are [batch x time x size]."""
+
+    def dropout_lstm_cell():
+        return tf.contrib.rnn.DropoutWrapper(
+            tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
+            input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
+
+    layers = [dropout_lstm_cell() for _ in range(1)]
+    with tf.variable_scope(name):
+        return tf.nn.dynamic_rnn(
+            tf.contrib.rnn.MultiRNNCell(layers),
+            inputs,
+            initial_state=initial_state,
+            dtype=tf.float32,
+            time_major=False)
+
+
 def reverse_and_reduce_gradient(x, hparams=None):
     if hparams is None:
         grad_mul = 0.01
@@ -99,7 +117,8 @@ class TransformerGAN(Transformer):
         embed_dim = self._hparams.hidden_size
         noise = tf.random_uniform(shape=tf.shape(decoder_input), minval=-0.5, maxval=0.5)
         noise *= tf.get_variable("noise_bandwidth", dtype=tf.float32, shape=[embed_dim])
-        decoder_input = noise
+
+        decoder_input += noise
 
         decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(decoder_input, hparams)
 
@@ -122,8 +141,15 @@ class TransformerGAN(Transformer):
 
         encoder_output, encoder_decoder_attention_bias = (None, None)
         if inputs is not None:
+            inputs, _ = common_layers.pad_to_same_length(inputs, targets)
+
             target_space = features["target_space_id"]
             encoder_output, encoder_decoder_attention_bias = self.encode(inputs, target_space, hparams)
+
+            train = hparams.mode == tf.estimator.ModeKeys.TRAIN
+            targets = fertility_model(inputs, hparams, train, "fertility_model")
+        else:
+            targets = tf.zeros_like(targets)
 
         targets = common_layers.flatten4d3d(targets)
         decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(targets, hparams)
@@ -237,7 +263,7 @@ def transformer_gan_base():
 
 def decay_gradient(outputs, decay_period):
     masking = common_layers.inverse_lin_decay(decay_period)
-    masking = tf.minimum(tf.maximum(masking, 0.0), 1.0)
+    masking = tf.minimum(tf.maximum(masking, 0.0), 0.95)
     tf.summary.scalar("loss_mask", masking)
     return tf.stop_gradient(masking * outputs) + (1.0 - masking) * outputs
 
