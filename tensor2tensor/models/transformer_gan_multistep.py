@@ -32,10 +32,12 @@ def fertility_model(inputs, hparams, modality, train, name):
                 next_cell_state = initial_state
                 next_input = tf.random_uniform(shape=[tf.shape(inputs)[0], 512], minval=-0.00, maxval=0.00, dtype=tf.float32) #GO
             else:
-                with tf.variable_scope(modality.name, reuse=None):
-                    word_probs = tf.nn.softmax(modality.top(cell_output, None), dim=-1)
-                    word_ids = common_layers.sample_with_temperature(word_probs, hparams.z_temp)
-                    next_input = modality.bottom(word_ids)
+                with tf.variable_scope(tf.VariableScope(True)):
+                    with tf.variable_scope(modality.name, reuse=True):
+                        word_probs = tf.nn.softmax(modality.top(cell_output, None), dim=-1)
+                        word_ids = common_layers.sample_with_temperature(word_probs, hparams.z_temp)
+                        word_ids = tensor_reshape = tf.reshape(word_ids, [-1, 1, 1, 1])
+                        next_input = tf.squeeze(modality.bottom(word_ids), [1, 2])
                 next_cell_state = cell_state
 
             elements_finished = (time >= sequence_length)
@@ -185,7 +187,7 @@ class TransformerGAN(Transformer):
             encoder_output, encoder_decoder_attention_bias = self.encode(inputs, target_space, hparams)
 
             train = hparams.mode == tf.estimator.ModeKeys.TRAIN
-            targets = fertility_model(inputs, hparams, train, "fertility_model")
+            targets = fertility_model(inputs, hparams, self._problem_hparams.target_modality, train, "fertility_model")
         else:
             targets = tf.zeros_like(targets)
 
