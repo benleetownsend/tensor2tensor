@@ -20,23 +20,25 @@ def reverse_grad(x):
     return tf.stop_gradient(2 * x) - x
 
 
-def fertility_model(inputs, hparams, train, name):
+def fertility_model(inputs, hparams, modality, train, name):
     """Run LSTM cell on inputs, assuming they are [batch x time x size]."""
     inputs = tf.squeeze(inputs, 2)
 
     def get_decoder_loop_fn(sequence_length, initial_state):
         def loop_fn(time, cell_output, cell_state, loop_state):
+
             emit_output = cell_output
             if cell_output is None:
                 next_cell_state = initial_state
                 next_input = tf.random_uniform(shape=[tf.shape(inputs)[0], 512], minval=-0.00, maxval=0.00, dtype=tf.float32) #GO
-                
             else:
+                with tf.variable_scope(modality.name, reuse=None):
+                    word_probs = tf.nn.softmax(modality.top(cell_output, None), dim=-1)
+                    word_ids = common_layers.sample_with_temperature(word_probs, hparams.z_temp)
+                    next_input = modality.bottom(word_ids)
                 next_cell_state = cell_state
-                next_input = cell_output + tf.random_uniform(shape=[tf.shape(inputs)[0], 512], minval=-0.01, maxval=0.01, dtype=tf.float32)
-    
+
             elements_finished = (time >= sequence_length)
-            finished = tf.reduce_all(elements_finished)
             next_loop_state = None
 
             return (elements_finished, next_input, next_cell_state, emit_output, next_loop_state)
@@ -306,6 +308,7 @@ def transformer_gan_base():
     hparams.add_hparam("mle_decay_period", 1500000)
     hparams.add_hparam("lipschitz_mult", 1e5)
     hparams.add_hparam("fertility_cells", 1)
+    hparams.add_hparam("z_temp", 0.1)
     return hparams
 
 def decay_gradient(outputs, decay_period, final_val=1.0):
