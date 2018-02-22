@@ -16,6 +16,56 @@ import tensorflow as tf
 import numpy as np
 
 
+def lstm_bid_encoder(inputs, hparams, train, name):
+    """Bidirectional LSTM for encoding inputs that are [batch x time x size]."""
+
+    def dropout_lstm_cell():
+        return tf.contrib.rnn.DropoutWrapper(
+            tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
+            input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
+
+    with tf.variable_scope(name):
+        cell_fw = tf.contrib.rnn.MultiRNNCell(
+            [dropout_lstm_cell() for _ in range(hparams.num_hidden_layers)])
+
+        cell_bw = tf.contrib.rnn.MultiRNNCell(
+            [dropout_lstm_cell() for _ in range(hparams.num_hidden_layers)])
+
+        ((encoder_fw_outputs, encoder_bw_outputs),
+         (encoder_fw_state, encoder_bw_state)) = tf.nn.bidirectional_dynamic_rnn(
+            cell_fw=cell_fw,
+            cell_bw=cell_bw,
+            inputs=inputs,
+            dtype=tf.float32,
+            time_major=False)
+
+        encoder_outputs = tf.concat((encoder_fw_outputs, encoder_bw_outputs), 2)
+        encoder_states = []
+
+        for i in range(hparams.num_hidden_layers):
+            if isinstance(encoder_fw_state[i], tf.contrib.rnn.LSTMStateTuple):
+                encoder_state_c = tf.concat(
+                    values=(encoder_fw_state[i].c, encoder_bw_state[i].c),
+                    axis=1,
+                    name="encoder_fw_state_c")
+                encoder_state_h = tf.concat(
+                    values=(encoder_fw_state[i].h, encoder_bw_state[i].h),
+                    axis=1,
+                    name="encoder_fw_state_h")
+                encoder_state = tf.contrib.rnn.LSTMStateTuple(
+                    c=encoder_state_c, h=encoder_state_h)
+            elif isinstance(encoder_fw_state[i], tf.Tensor):
+                encoder_state = tf.concat(
+                    values=(encoder_fw_state[i], encoder_bw_state[i]),
+                    axis=1,
+                    name="bidirectional_concat")
+
+            encoder_states.append(encoder_state)
+
+        encoder_states = tuple(encoder_states)
+        return encoder_outputs, encoder_states
+
+
 def reverse_grad(x):
     return tf.stop_gradient(2 * x) - x
 
@@ -30,7 +80,8 @@ def fertility_model(inputs, hparams, modality, train, name):
             emit_output = cell_output
             if cell_output is None:
                 next_cell_state = initial_state
-                next_input = tf.random_uniform(shape=[tf.shape(inputs)[0], 512], minval=-0.00, maxval=0.00, dtype=tf.float32) #GO
+                next_input = tf.random_uniform(shape=[tf.shape(inputs)[0], 512], minval=-0.00, maxval=0.00,
+                                               dtype=tf.float32)  # GO
             else:
                 with tf.variable_scope(tf.VariableScope(True)):
                     with tf.variable_scope(modality.name, reuse=True):
@@ -42,36 +93,38 @@ def fertility_model(inputs, hparams, modality, train, name):
 
             elements_finished = (time >= sequence_length)
             next_loop_state = None
-
             return (elements_finished, next_input, next_cell_state, emit_output, next_loop_state)
+
         return loop_fn
-            
+
     def dropout_lstm_cell():
         return tf.contrib.rnn.DropoutWrapper(
             tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
             input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
 
-    with tf.variable_scope("encoder_lstms"):
-        encoder_layers = [dropout_lstm_cell() for _ in range(hparams.fertility_cells)]
     with tf.variable_scope("decoder_lstms"):
         decoder_layers = [dropout_lstm_cell() for _ in range(hparams.fertility_cells)]
-    
-    with tf.variable_scope(name):
-        with tf.variable_scope("encoder_lstms"):
-            _, encoder_out = tf.nn.dynamic_rnn(
-                tf.contrib.rnn.MultiRNNCell(encoder_layers),
-                inputs,
-                initial_state=None,
-                dtype=tf.float32,
-                time_major=False)
 
-        with tf.variable_scope("decoder_lstms"):            
-            outputs, _, _ = tf.nn.raw_rnn(tf.contrib.rnn.MultiRNNCell(decoder_layers), get_decoder_loop_fn(tf.shape(inputs)[1], encoder_out))
+    attention_mechanism_class = tf.contrib.seq2seq.LuongAttention
+
+    with tf.variable_scope(name):
+        encoder_outputs, encoder_final_state = lstm_bid_encoder(inputs, hparams, train, name+"Encoder")
+
+        attention_mechanism = attention_mechanism_class(hparams.hidden_size, encoder_outputs)
+
+        attn_cell = tf.contrib.seq2seq.AttentionWrapper(
+            tf.nn.rnn_cell.MultiRNNCell(decoder_layers),
+            attention_mechanism,
+            attention_layer_size=hparams.hidden_size,
+            output_attention=True)
+
+        with tf.variable_scope("decoder_lstms"):
+            outputs, _, _ = tf.nn.raw_rnn(attn_cell,
+                                          get_decoder_loop_fn(tf.shape(inputs)[1], encoder_final_state))
 
         outputs = _transpose_batch_time(outputs.stack())
-        
+
         return tf.expand_dims(outputs, 2)
-            
 
 
 def reverse_and_reduce_gradient(x, hparams=None):
@@ -136,8 +189,8 @@ class LazyPinv:
         self.call_count = 0
 
     def __call__(self, inp):
-        self.call_count +=1 
-        if self.call_count % 10000==0 or self.state is None or np.linalg.norm(self.state - inp) > 10.0:
+        self.call_count += 1
+        if self.call_count % 10000 == 0 or self.state is None or np.linalg.norm(self.state - inp) > 10.0:
             self.cache = np.linalg.pinv(inp)
             self.state = inp
         return self.cache
@@ -158,11 +211,11 @@ class TransformerGAN(Transformer):
                cache=None,
                nonpadding=None):
 
-        #embed_dim = self._hparams.hidden_size
-        #noise = tf.random_uniform(shape=tf.shape(decoder_input), minval=-0.05, maxval=0.05)
-        #noise *= tf.get_variable("noise_bandwidth", dtype=tf.float32, shape=[embed_dim])#
+        # embed_dim = self._hparams.hidden_size
+        # noise = tf.random_uniform(shape=tf.shape(decoder_input), minval=-0.05, maxval=0.05)
+        # noise *= tf.get_variable("noise_bandwidth", dtype=tf.float32, shape=[embed_dim])#
 
-#        decoder_input += noise
+        #        decoder_input += noise
 
         return super(TransformerGAN, self).decode(decoder_input,
                                                   encoder_output,
@@ -193,10 +246,10 @@ class TransformerGAN(Transformer):
 
         targets = common_layers.flatten4d3d(targets)
         decoder_self_attention_bias = (
-                  common_attention.attention_bias_lower_triangle(tf.shape(targets)[1]))
+            common_attention.attention_bias_lower_triangle(tf.shape(targets)[1]))
         decoder_input = common_attention.add_timing_signal_1d(targets)
-                              
-#        decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(targets, hparams)
+
+        #        decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(targets, hparams)
 
         decode_out = self.decode(decoder_input, encoder_output,
                                  encoder_decoder_attention_bias,
@@ -286,7 +339,7 @@ class TransformerGAN(Transformer):
         with tf.variable_scope(modality.name, reuse=None):
             logits = modality.top(*body_out)
 
-#        logits = tf.squeeze(logits, -2)
+        # logits = tf.squeeze(logits, -2)
         features["inputs"] = raw_inputs
         return common_layers.sample_with_temperature(logits, 0.0), None
 
@@ -301,6 +354,7 @@ def transformer_gan_base():
     hparams.optimizer = "SGD"
     hparams.summarize_grads = True
     hparams.clip_grad_norm = 1000.0
+    hparams.num_decoder_layers = 4
     hparams.add_hparam("num_compress_steps", 2)
     hparams.add_hparam("num_decode_steps", 0)
     hparams.add_hparam("discrim_grad_mul", 0.01)
@@ -312,6 +366,7 @@ def transformer_gan_base():
     hparams.add_hparam("fertility_cells", 1)
     hparams.add_hparam("z_temp", 0.1)
     return hparams
+
 
 def decay_gradient(outputs, decay_period, final_val=1.0):
     masking = common_layers.inverse_lin_decay(decay_period)
@@ -325,8 +380,9 @@ class GANSymbolModality(modalities.SymbolModality):
     @property
     def targets_weights_fn(self):
         return common_layers.weights_all
-        
-    
+
     def loss(self, *args, **kwargs):
         loss, weights = super(GANSymbolModality, self).loss(*args, weights_fn=common_layers.weights_all)
-        return decay_gradient(loss, self._model_hparams.mle_decay_period, final_val=0.95), decay_gradient(weights, self._model_hparams.mle_decay_period, final_val=0.95)
+        return decay_gradient(loss, self._model_hparams.mle_decay_period, final_val=0.95), decay_gradient(weights,
+                                                                                                          self._model_hparams.mle_decay_period,
+                                                                                                          final_val=0.95)
