@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2017 The Tensor2Tensor Authors.
+# Copyright 2018 The Tensor2Tensor Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,50 @@ class RevBlockTest(tf.test.TestCase):
   CHANNELS = 8
   NUM_LAYERS = 4
   BATCH_SIZE = 16
+
+  def testForwardBackward(self):
+
+    def f(x):
+      return tf.layers.dense(x, self.CHANNELS // 2, use_bias=True)
+
+    def g(x):
+      return tf.layers.dense(x, self.CHANNELS // 2, use_bias=True)
+
+    x = tf.random_uniform([self.BATCH_SIZE, self.CHANNELS], dtype=tf.float32)
+    x1, x2 = tf.split(x, 2, axis=-1)
+
+    block = rev_block.RevBlock(f, g, num_layers=3)
+    y1, y2 = block.forward(x1, x2)
+    x1_inv, x2_inv = block.backward(y1, y2)
+
+    with self.test_session() as sess:
+      sess.run(tf.global_variables_initializer())
+      x1, x2, x1_inv, x2_inv = sess.run([x1, x2, x1_inv, x2_inv])
+
+      self.assertAllClose(x1, x1_inv)
+      self.assertAllClose(x2, x2_inv)
+
+  def testBackwardForward(self):
+
+    def f(x):
+      return tf.layers.dense(x, self.CHANNELS // 2, use_bias=True)
+
+    def g(x):
+      return tf.layers.dense(x, self.CHANNELS // 2, use_bias=True)
+
+    y = tf.random_uniform([self.BATCH_SIZE, self.CHANNELS], dtype=tf.float32)
+    y1, y2 = tf.split(y, 2, axis=-1)
+
+    block = rev_block.RevBlock(f, g, num_layers=3)
+    x1, x2 = block.backward(y1, y2)
+    y1_inv, y2_inv = block.forward(x1, x2)
+
+    with self.test_session() as sess:
+      sess.run(tf.global_variables_initializer())
+      y1, y2, y1_inv, y2_inv = sess.run([y1, y2, y1_inv, y2_inv])
+
+      self.assertAllClose(y1, y1_inv)
+      self.assertAllClose(y2, y2_inv)
 
   def _testRevBlock(self,
                     x=None,
@@ -137,53 +181,6 @@ class RevBlockTest(tf.test.TestCase):
       return x
 
     self._testRevBlock(x=x, f=f)
-
-
-class RecomputeTest(tf.test.TestCase):
-
-  def testRecompute(self):
-
-    def layer(x, name=None):
-      with tf.variable_scope(name, default_name="layer"):
-        x = tf.contrib.layers.layer_norm(x)
-        x = tf.layers.conv1d(
-            x,
-            10,
-            1,
-            use_bias=False,
-            kernel_initializer=tf.constant_initializer(42.42))
-        x = tf.nn.relu(x)
-        return x
-
-    def fn(x):
-      out = x
-      for _ in range(3):
-        out = layer(out)
-      return out
-
-    @rev_block.recompute_grad
-    def fn_recompute(x):
-      return fn(x)
-
-    x = tf.random_uniform((3, 1, 3))
-    recompute_vars = None
-    with tf.variable_scope("recompute") as vs:
-      out1 = tf.reduce_sum(fn_recompute(x))
-      recompute_vars = vs.trainable_variables()
-    reg_vars = None
-    with tf.variable_scope("regular") as vs:
-      out2 = tf.reduce_sum(fn(x))
-      reg_vars = vs.trainable_variables()
-
-    grad1 = tf.gradients(out1, recompute_vars)
-    grad2 = tf.gradients(out2, reg_vars)
-
-    with self.test_session() as sess:
-      sess.run(tf.global_variables_initializer())
-      outs = sess.run([out1, out2, grad1, grad2])
-      self.assertAllClose(outs[0], outs[1])
-      for g1, g2 in zip(outs[2], outs[3]):
-        self.assertAllClose(g1, g2)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2017 The Tensor2Tensor Authors.
+# Copyright 2018 The Tensor2Tensor Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,7 +47,7 @@ class BeamSearchTest(tf.test.TestCase):
 
     self.assertEqual(final_ids.get_shape().as_list(), [None, beam_size, None])
 
-    self.assertEqual(final_probs.get_shape().as_list(), [None, beam_size])
+    self.assertEqual(final_probs.get_shape().as_list(), [batch_size, beam_size])
 
   def testComputeTopkScoresAndSeq(self):
     batch_size = 2
@@ -303,7 +303,8 @@ class BeamSearchTest(tf.test.TestCase):
     states = {
         "state": tf.zeros((batch_size, 1)),
     }
-    states["state"]._shape = tf.TensorShape((None, 1))
+    states["state"] = tf.placeholder_with_default(
+        states["state"], shape=(None, 1))
 
     final_ids, _ = beam_search.beam_search(
         symbols_to_logits,
@@ -352,7 +353,8 @@ class BeamSearchTest(tf.test.TestCase):
     states = {
         "state": tf.zeros((batch_size, 1)),
     }
-    states["state"]._shape = tf.TensorShape((None, 1))
+    states["state"] = tf.placeholder_with_default(
+        states["state"], shape=(None, 1))
 
     final_ids, _ = beam_search.beam_search(
         symbols_to_logits,
