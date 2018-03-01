@@ -8,7 +8,7 @@ from tensor2tensor.layers import modalities
 from tensor2tensor.layers import common_layers
 from tensor2tensor.layers import common_attention
 from tensor2tensor.utils import registry
-from tensor2tensor.models import transformer_vae
+#from tensor2tensor.models import transformer_vae
 from tensor2tensor.models.transformer import Transformer, transformer_base_single_gpu, transformer_prepare_decoder
 from tensorflow.python.ops.rnn import _transpose_batch_time
 
@@ -382,7 +382,7 @@ class GANSymbolModality(modalities.SymbolModality):
         return common_layers.weights_all
 
     def loss(self, *args, **kwargs):
-        loss, weights = super(GANSymbolModality, self).loss(*args, weights_fn=common_layers.weights_all)
+        loss, weights = super(GANSymbolModality, self).loss(*args)
         return decay_gradient(loss, self._model_hparams.mle_decay_period, final_val=0.95), decay_gradient(weights,
                                                                                                           self._model_hparams.mle_decay_period,
                                                                                                           final_val=0.95)
