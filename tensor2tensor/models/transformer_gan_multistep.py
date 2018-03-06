@@ -15,34 +15,63 @@ from tensorflow.python.ops.rnn import _transpose_batch_time
 import tensorflow as tf
 import numpy as np
 
+def linear(input_, output_size, scope=None):
+    shape = input_.get_shape().as_list()
+    if len(shape) != 2:
+        raise ValueError("Linear is expecting 2D arguments: %s" % str(shape))
+    if not shape[1]:
+        raise ValueError("Linear expects shape[1] of arguments: %s" % str(shape))
+    input_size = shape[1]
+
+    # Now the computation.
+    with tf.variable_scope(scope or "SimpleLinear"):
+        matrix = tf.get_variable("Matrix", [output_size, input_size], dtype=input_.dtype)
+        bias_term = tf.get_variable("Bias", [output_size], dtype=input_.dtype)
+        return tf.matmul(input_, tf.transpose(matrix)) + bias_term
+
+def highway(input_, size, num_layers=1, bias=-2.0, f=tf.nn.relu, scope='Highway'):
+    """Highway Network (cf. http://arxiv.org/abs/1505.00387).                                                                                                                                                                                                                                    
+    t = sigmoid(Wy + b)                                                                                                                                                                                                                                                                          
+    z = t * g(Wy + b) + (1 - t) * y                                                                                                                                                                                                                                                              
+    where g is nonlinearity, t is transform gate, and (1 - t) is carry gate.                                                                                                                                                                                                                     
+    """
+
+    with tf.variable_scope(scope):
+        for idx in range(num_layers):
+            g = f(linear(input_, size, scope='highway_lin_%d' % idx))
+            t = tf.sigmoid(linear(input_, size, scope='highway_gate_%d' % idx) + bias)
+            output = t * g + (1. - t) * input_
+            input_ = output
+        return output
 
 def lstm_bid_encoder(inputs, hparams, train, name):
     """Bidirectional LSTM for encoding inputs that are [batch x time x size]."""
 
     def dropout_lstm_cell():
         return tf.contrib.rnn.DropoutWrapper(
-            tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
+            tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size//2),
             input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
 
     with tf.variable_scope(name):
         cell_fw = tf.contrib.rnn.MultiRNNCell(
-            [dropout_lstm_cell() for _ in range(hparams.num_hidden_layers)])
+            [dropout_lstm_cell() for _ in range(hparams.fertility_cells)])
 
         cell_bw = tf.contrib.rnn.MultiRNNCell(
-            [dropout_lstm_cell() for _ in range(hparams.num_hidden_layers)])
+            [dropout_lstm_cell() for _ in range(hparams.fertility_cells)])
 
         ((encoder_fw_outputs, encoder_bw_outputs),
          (encoder_fw_state, encoder_bw_state)) = tf.nn.bidirectional_dynamic_rnn(
             cell_fw=cell_fw,
             cell_bw=cell_bw,
             inputs=inputs,
+             swap_memory=False,
             dtype=tf.float32,
             time_major=False)
 
         encoder_outputs = tf.concat((encoder_fw_outputs, encoder_bw_outputs), 2)
         encoder_states = []
 
-        for i in range(hparams.num_hidden_layers):
+        for i in range(hparams.fertility_cells):
             if isinstance(encoder_fw_state[i], tf.contrib.rnn.LSTMStateTuple):
                 encoder_state_c = tf.concat(
                     values=(encoder_fw_state[i].c, encoder_bw_state[i].c),
@@ -118,10 +147,16 @@ def fertility_model(inputs, hparams, modality, train, name):
             attention_layer_size=hparams.hidden_size,
             output_attention=True)
 
+        batch_size = inputs.get_shape()[0].value
+        if batch_size is None:
+            batch_size = tf.shape(inputs)[0]
+        initial_state = attn_cell.zero_state(batch_size, tf.float32).clone(
+                  cell_state=encoder_final_state)
+        
         with tf.variable_scope("decoder_lstms"):
             outputs, _, _ = tf.nn.raw_rnn(attn_cell,
-                                          get_decoder_loop_fn(tf.shape(inputs)[1], encoder_final_state))
-
+                                          get_decoder_loop_fn(tf.shape(inputs)[1], initial_state),
+                                          swap_memory=True)
         outputs = _transpose_batch_time(outputs.stack())
 
         return tf.expand_dims(outputs, 2)
@@ -168,18 +203,56 @@ def discriminator(embedded_trans, embedded_context, hparams, usage, reuse=False)
     else:
         raise KeyError("usage not in real, fake or gp")
 
+    filter_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20]
+    num_filters = [100, 200, 200, 200, 200, 100, 100, 100, 100, 100, 100, 100]
+    h0, i0 = common_layers.pad_to_same_length(embedded_trans, embedded_context, final_length_divisible_by=max(filter_sizes))
+        
     with tf.variable_scope("discriminator", reuse=reuse):
-        if embedded_context is not None:
-            h0, i0 = common_layers.pad_to_same_length(
-                embedded_trans, embedded_context, final_length_divisible_by=16)
-            h0 = tf.concat([h0, i0], axis=-1)
+        h0 = tf.expand_dims(tf.squeeze(h0, -2), -1)
+        i0 = tf.expand_dims(tf.squeeze(i0, -2), -1)
+        
+        sequence_length = h0.get_shape()[1]
+        pooled_outputs = []
+        if hparams.max_length == 0:
+            raise Exception("Max length must be set")
+        for embedded, data_name in zip([h0, i0], ["trans", "context"]):
+            for filter_size, num_filter in zip(filter_sizes, num_filters):
+                with tf.variable_scope("conv-maxpool-%s-%s" % (filter_size, data_name), reuse=reuse):
+                    # Convolution Layer
+                    filter_shape = [filter_size, hparams.hidden_size, 1, num_filter]
+                    W = tf.get_variable("W", shape=filter_shape)
+                    b = tf.get_variable("b", shape=[num_filter])
+                    conv = tf.nn.conv2d(
+                        embedded,
+                        W,
+                        strides=[1, 1, 1, 1],
+                        padding="VALID",
+                        name="conv")
+                    h = tf.nn.relu(tf.nn.bias_add(conv, b), name="relu")
+#                    pooled = tf.nn.max_pool(
+#                        h,
+#                        ksize=[1, hparams.max_length  -  filter_size + 1, 1, 1],
+#                        strides=[1, 1, 1, 1],
+#                        padding='VALID',
+#                        name="pool")
+                    pooled= tf.reduce_max(h, axis=1, keep_dims=True) 
+                    pooled_outputs.append(pooled)
+        num_filters_total = sum(num_filters) * 2
+        h_pool = tf.concat(pooled_outputs, 3)
+        h_pool_flat = tf.reshape(h_pool, [-1, num_filters_total])
 
-        h0 = tf.layers.dense(h0, hparams.hidden_size, name="io")
-        h1 = transformer_vae.compress(h0, None, False, hparams, "compress1")
-        h2 = transformer_vae.compress(h1, None, False, hparams, "compress2")
-        res_dense = tf.reduce_mean(h2, axis=[1, 2])
-        res_single = tf.squeeze(tf.layers.dense(res_dense, 1), axis=-1)
-        return res_single
+
+        with tf.variable_scope("highway", reuse=reuse):
+            h_highway = highway(h_pool_flat, h_pool_flat.get_shape()[1], 1, 0)
+            
+        with tf.variable_scope("dropout", reuse=reuse):
+            h_drop = tf.nn.dropout(h_highway, 1.0 - hparams.discrim_dropout)
+                
+        with tf.variable_scope("output", reuse=reuse):
+            W = tf.get_variable("W", shape=[num_filters_total, 1])
+            b = tf.get_variable("b", shape=[1])
+            score = tf.nn.xw_plus_b(h_drop, W, b, name="scores")
+        return score
 
 
 class LazyPinv:
@@ -230,8 +303,6 @@ class TransformerGAN(Transformer):
         inputs = features.get("inputs", None)
         hparams = self._hparams
 
-        features["inputs"] = decay_gradient(features["inputs"], hparams.mle_decay_period)
-
         encoder_output, encoder_decoder_attention_bias = (None, None)
         if inputs is not None:
             inputs, features["targets"] = common_layers.pad_to_same_length(inputs, targets)
@@ -253,7 +324,7 @@ class TransformerGAN(Transformer):
 
         decode_out = self.decode(decoder_input, encoder_output,
                                  encoder_decoder_attention_bias,
-                                 decoder_self_attention_bias, hparams)
+                                 tf.ones_like(decoder_self_attention_bias), hparams)
 
         with tf.variable_scope(tf.VariableScope(True)):
             with tf.variable_scope(target_modality.name + "/shared", reuse=True):
@@ -349,40 +420,56 @@ def transformer_gan_base():
     hparams = transformer_base_single_gpu()
     hparams.input_modalities = "inputs:symbol:GAN"
     hparams.target_modality = "symbol:GAN"
-    hparams.batch_size = 1024
+    hparams.batch_size = 512
+    hparams.learning_rate = 0.0002
     hparams.learning_rate_decay_scheme = "none"
     hparams.optimizer = "SGD"
     hparams.summarize_grads = True
     hparams.clip_grad_norm = 1000.0
     hparams.num_decoder_layers = 4
+    hparams.max_length = 256
     hparams.add_hparam("num_compress_steps", 2)
     hparams.add_hparam("num_decode_steps", 0)
     hparams.add_hparam("discrim_grad_mul", 0.01)
     hparams.add_hparam("gan_label_smoothing", 1)
     hparams.add_hparam("step_interval", 1)
-    hparams.add_hparam("warmup_steps", 1700000)
-    hparams.add_hparam("mle_decay_period", 1500000)
-    hparams.add_hparam("lipschitz_mult", 1e5)
+    hparams.add_hparam("warmup_steps", 160000)
+    hparams.add_hparam("mle_decay_period", 150000)
+    hparams.add_hparam("lipschitz_mult", 150.0)
     hparams.add_hparam("fertility_cells", 1)
-    hparams.add_hparam("z_temp", 0.1)
+    hparams.add_hparam("z_temp", 0.05)
+    hparams.add_hparam("discrim_dropout", 0.1)
     return hparams
 
+@registry.register_hparams
+def transformer_gan_base_mini():
+    hparams = transformer_gan_base()
+    hparams.hidden_size = 128
+    return hparams
+    
 
-def decay_gradient(outputs, decay_period, final_val=1.0):
+def decay_gradient(outputs, decay_period, final_val=0.95, summarize=True):
     masking = common_layers.inverse_lin_decay(decay_period)
     masking = tf.minimum(tf.maximum(masking, 0.0), final_val)
-    tf.summary.scalar("loss_mask", masking)
+    if summarize:
+        tf.summary.scalar("loss_mask", masking)
     return tf.stop_gradient(masking * outputs) + (1.0 - masking) * outputs
 
 
 @registry.register_symbol_modality("GAN")
 class GANSymbolModality(modalities.SymbolModality):
+    def _get_weights(self, hidden_dim=None):
+        weights = super(GANSymbolModality, self)._get_weights(hidden_dim=hidden_dim)
+        if type(weights) == list:
+            weights = [decay_gradient(w, self._model_hparams.mle_decay_period, summarize=False) for w in weights]
+        else:
+            weights = decay_gradient(weights,  self._model_hparams.mle_decay_period, summarize=False)
+        return weights
+    
     @property
     def targets_weights_fn(self):
         return common_layers.weights_all
 
     def loss(self, *args, **kwargs):
         loss, weights = super(GANSymbolModality, self).loss(*args, weights_fn=common_layers.weights_all)
-        return decay_gradient(loss, self._model_hparams.mle_decay_period, final_val=0.95), decay_gradient(weights,
-                                                                                                          self._model_hparams.mle_decay_period,
-                                                                                                          final_val=0.95)
+        return decay_gradient(loss, self._model_hparams.mle_decay_period), weights
