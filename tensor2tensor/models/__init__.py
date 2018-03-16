@@ -45,4 +45,5 @@ from tensor2tensor.models import transformer_vae
 from tensor2tensor.models import vanilla_gan
 from tensor2tensor.models import xception
 from tensor2tensor.models import transformer_adv
+from tensor2tensor.models import get_data_for_fast_align
 # pylint: enable=unused-import
