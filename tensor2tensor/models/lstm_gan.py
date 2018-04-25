@@ -4,23 +4,134 @@ from __future__ import print_function
 
 # Dependency imports
 from six.moves import xrange  # pylint: disable=redefined-builtin
+from tensor2tensor.utils import t2t_model
 
-from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import expert_utils as eu
+from tensor2tensor.models.language.output_smooth import SmoothOutput
+
+import pickle
+
+# Dependency imports
+
 from tensor2tensor.layers import modalities
 from tensor2tensor.layers import common_layers
-from tensor2tensor.layers import common_attention
 from tensor2tensor.utils import registry
-from tensor2tensor.models import transformer_vae
-from tensor2tensor.models.transformer import Transformer, transformer_base_single_gpu, transformer_prepare_decoder
+from tensor2tensor.models.transformer import transformer_base_single_gpu
 from tensorflow.python.ops.rnn import _transpose_batch_time
-#from tensor2tensor.fertility_model.alignments_to_fertility import FertilityModel
-from tensor2tensor.models.fertility import FertilityModel as DQNFertility
-from tensor2tensor.models.fertility import tf_decomposed_gleu
-from tensor2tensor.models.language.output_smooth import SmoothOutput
+
 import tensorflow as tf
-import numpy as np
-import pickle
+
+
+def lstm_bid_encoder(inputs, hparams, train, name):
+    """Bidirectional LSTM for encoding inputs that are [batch x time x size]."""
+
+    def dropout_lstm_cell():
+        return tf.contrib.rnn.DropoutWrapper(
+            tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
+            input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
+
+    with tf.variable_scope(name):
+        cell_fw = tf.contrib.rnn.MultiRNNCell(
+            [dropout_lstm_cell() for _ in range(hparams.num_encoder_layers)])
+
+        cell_bw = tf.contrib.rnn.MultiRNNCell(
+            [dropout_lstm_cell() for _ in range(hparams.num_encoder_layers)])
+
+        ((encoder_fw_outputs, encoder_bw_outputs),
+         (encoder_fw_state, encoder_bw_state)) = tf.nn.bidirectional_dynamic_rnn(
+            cell_fw=cell_fw,
+            cell_bw=cell_bw,
+            inputs=inputs,
+            dtype=tf.float32,
+            time_major=False)
+
+        encoder_outputs = tf.concat((encoder_fw_outputs, encoder_bw_outputs), 2)
+        encoder_states = []
+
+        for i in range(hparams.num_encoder_layers):
+            if isinstance(encoder_fw_state[i], tf.contrib.rnn.LSTMStateTuple):
+                encoder_state_c = tf.concat(
+                    values=(encoder_fw_state[i].c, encoder_bw_state[i].c),
+                    axis=1,
+                    name="encoder_fw_state_c")
+                encoder_state_h = tf.concat(
+                    values=(encoder_fw_state[i].h, encoder_bw_state[i].h),
+                    axis=1,
+                    name="encoder_fw_state_h")
+                encoder_state = tf.contrib.rnn.LSTMStateTuple(
+                    c=encoder_state_c, h=encoder_state_h)
+            elif isinstance(encoder_fw_state[i], tf.Tensor):
+                encoder_state = tf.concat(
+                    values=(encoder_fw_state[i], encoder_bw_state[i]),
+                    axis=1,
+                    name="bidirectional_concat")
+
+            encoder_states.append(encoder_state)
+
+        encoder_states = tuple(encoder_states)
+        return encoder_outputs, encoder_states
+
+
+def reverse_grad(x):
+    return tf.stop_gradient(2 * x) - x
+
+
+def generator(inputs, hparams, modality, train, name):
+    """Run LSTM cell on inputs, assuming they are [batch x time x size]."""
+    inputs = tf.squeeze(inputs, 2)
+
+    def get_decoder_loop_fn(sequence_length, initial_state):
+        def loop_fn(time, cell_output, cell_state, loop_state):
+
+            emit_output = cell_output
+            if cell_output is None:
+                next_cell_state = initial_state
+                next_input = tf.random_uniform(shape=[tf.shape(inputs)[0], hparams.hidden_size], minval=-0.00, maxval=0.00,
+                                               dtype=tf.float32)  # GO
+            else:
+                with tf.variable_scope(tf.VariableScope(True)):
+                    with tf.variable_scope(modality.name, reuse=True):
+                        word_probs = tf.nn.softmax(modality.top(cell_output, None), dim=-1)
+                        word_ids = common_layers.sample_with_temperature(word_probs, hparams.z_temp)
+                        word_ids = tf.reshape(word_ids, [-1, 1, 1, 1])
+                        next_input = tf.squeeze(modality.bottom(word_ids), [1, 2])
+                next_cell_state = cell_state
+
+            elements_finished = (time >= sequence_length)
+            next_loop_state = None
+            return elements_finished, next_input, next_cell_state, emit_output, next_loop_state
+
+        return loop_fn
+
+    def dropout_lstm_cell():
+        return tf.contrib.rnn.DropoutWrapper(
+            tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
+            input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
+
+    with tf.variable_scope("decoder_lstms"):
+        decoder_layers = [dropout_lstm_cell() for _ in range(hparams.num_decoder_layers)]
+
+    attention_mechanism_class = tf.contrib.seq2seq.LuongAttention
+
+    with tf.variable_scope(name):
+        encoder_outputs, encoder_final_state = lstm_bid_encoder(inputs, hparams, train, name+"Encoder")
+
+        attention_mechanism = attention_mechanism_class(hparams.hidden_size, encoder_outputs)
+
+        attn_cell = tf.contrib.seq2seq.AttentionWrapper(
+            tf.nn.rnn_cell.MultiRNNCell(decoder_layers),
+            attention_mechanism,
+            attention_layer_size=hparams.hidden_size,
+            output_attention=True)
+
+        with tf.variable_scope("decoder_lstms"):
+            outputs, _, _ = tf.nn.raw_rnn(attn_cell,
+                                          get_decoder_loop_fn(tf.shape(inputs)[1], encoder_final_state))
+
+        outputs = _transpose_batch_time(outputs.stack())
+
+        return tf.expand_dims(outputs, 2)
+
 
 def linear(input_, output_size, scope=None):
     shape = input_.get_shape().as_list()
@@ -36,6 +147,7 @@ def linear(input_, output_size, scope=None):
         bias_term = tf.get_variable("Bias", [output_size], dtype=input_.dtype)
         return tf.matmul(input_, tf.transpose(matrix)) + bias_term
 
+
 def highway(input_, size, num_layers=1, bias=-2.0, f=tf.nn.relu, scope='Highway'):
     """Highway Network (cf. http://arxiv.org/abs/1505.00387).                                                                                                                                                                                                                                    
     t = sigmoid(Wy + b)                                                                                                                                                                                                                                                                          
@@ -47,8 +159,6 @@ def highway(input_, size, num_layers=1, bias=-2.0, f=tf.nn.relu, scope='Highway'
         for idx in range(num_layers):
             g = f(linear(input_, size, scope='highway_lin_%d' % idx))
             t = f(linear(g, size, scope='highway_gate_%d' % idx))
-#            output = t * g + (1. - t) * input_
-#            input_ = output #TODO(BEN) Remove this and maybe change to simple res net.
             output = g
         return output
 
@@ -57,7 +167,7 @@ def reverse_grad(x):
     return tf.stop_gradient(2 * x) - x
 
 
-def reverse_and_reduce_gradient(x, grad_pen, hparams=None):
+def reverse_and_reduce_gradient(x, hparams=None):
     if hparams is None:
         grad_mul = 0.01
         step_interval = None
@@ -77,26 +187,25 @@ def reverse_and_reduce_gradient(x, grad_pen, hparams=None):
         decay_multiplier = progress
         grad_mul *= gating_multiplier
         grad_mul *= decay_multiplier
-#        grad_mul *= 1 / (1 + grad_pen)
 
         tf.summary.scalar("gen_grad_mul", grad_mul)
 
     return tf.stop_gradient(x + grad_mul * x) - grad_mul * x
 
 
-def discriminator(embedded_trans, embedded_context, hparams, usage, reuse=False, grad_pen=None):
+def discriminator(embedded_trans, embedded_context, hparams, usage, reuse=False):
     """
     Usage in ["real", "fake", "gp"]
     """
-    leaky_relu = lambda x :tf.maximum(x, hparams.relu_leak * x)
-    
+    leaky_relu = lambda x: tf.maximum(x, hparams.relu_leak * x)
+
     if embedded_context is not None:
         embedded_context = tf.stop_gradient(embedded_context)
 
     if usage == "real":
         embedded_trans = tf.stop_gradient(embedded_trans)
     elif usage == "fake":
-        embedded_trans = reverse_and_reduce_gradient(embedded_trans, grad_pen, hparams)
+        embedded_trans = reverse_and_reduce_gradient(embedded_trans, hparams)
     elif usage == "gp":
         embedded_trans = embedded_trans
     else:
@@ -104,13 +213,13 @@ def discriminator(embedded_trans, embedded_context, hparams, usage, reuse=False,
 
     filter_sizes = [1, 2, 3, 4, 6, 8, 10]
     num_filters = [500, 500, 500, 500, 200, 200, 100]
-    h0, i0 = common_layers.pad_to_same_length(embedded_trans, embedded_context, final_length_divisible_by=max(filter_sizes))
-        
+    h0, i0 = common_layers.pad_to_same_length(embedded_trans, embedded_context,
+                                              final_length_divisible_by=max(filter_sizes))
+
     with tf.variable_scope("discriminator", reuse=reuse):
         h0 = tf.expand_dims(tf.squeeze(h0, -2), -1)
         i0 = tf.expand_dims(tf.squeeze(i0, -2), -1)
-        
-        sequence_length = h0.get_shape()[1]
+
         pooled_outputs = []
         if hparams.max_length == 0:
             raise Exception("Max length must be set")
@@ -128,25 +237,19 @@ def discriminator(embedded_trans, embedded_context, hparams, usage, reuse=False,
                         padding="VALID",
                         name="conv")
                     h = leaky_relu(tf.nn.bias_add(conv, b))
-#                    pooled = tf.nn.max_pool(
-#                        h,
-#                        ksize=[1, hparams.max_length  -  filter_size + 1, 1, 1],
-#                        strides=[1, 1, 1, 1],
-#                        padding='VALID',
-#                        name="pool")
-                    pooled= tf.reduce_mean(h, axis=1, keep_dims=True) 
+
+                    pooled = tf.reduce_mean(h, axis=1, keep_dims=True)
                     pooled_outputs.append(pooled)
         num_filters_total = sum(num_filters) * 2
         h_pool = tf.concat(pooled_outputs, 3)
         h_pool_flat = tf.reshape(h_pool, [-1, num_filters_total])
 
-
         with tf.variable_scope("highway", reuse=reuse):
             h_highway = highway(h_pool_flat, h_pool_flat.get_shape()[1], 1, 0, f=leaky_relu)
-            
+
         with tf.variable_scope("dropout", reuse=reuse):
             h_drop = tf.nn.dropout(h_highway, 1.0 - hparams.discrim_dropout)
-                
+
         with tf.variable_scope("output", reuse=reuse):
             W = tf.get_variable("W", shape=[num_filters_total, 1])
             b = tf.get_variable("b", shape=[1])
@@ -155,76 +258,16 @@ def discriminator(embedded_trans, embedded_context, hparams, usage, reuse=False,
 
 
 @registry.register_model
-class TransformerGAN(Transformer):
-    def decode(self,
-               decoder_input,
-               encoder_output,
-               encoder_decoder_attention_bias,
-               decoder_self_attention_bias,
-               hparams,
-               cache=None,
-               nonpadding=None):
-
-#        embed_dim = self._hparams.hidden_size
-#        noise = tf.random_uniform(shape=tf.shape(encoder_output), minval=-0.05, maxval=0.05)
-#        noise *= tf.get_variable("noise_bandwidth", dtype=tf.float32, shape=[embed_dim])
-#        encoder_output += noise
-#        decoder_input = tf.nn.dropout(decoder_input, 0.75)
-        return super(TransformerGAN, self).decode(decoder_input,
-                                                  encoder_output,
-                                                  encoder_decoder_attention_bias,
-                                                  decoder_self_attention_bias,
-                                                  hparams,
-                                                  cache=cache)
+class LstmGAN(t2t_model.T2TModel):
 
     def model_fn_body(self, features):
         target_modality = self._problem_hparams.target_modality
-        fert_filename = self._hparams.fertility_filename
 
-        original_targets  = features["targets"]
+        original_targets = features["targets"]
         inputs = features.get("inputs", None)
         hparams = self._hparams
 
-        encoder_output, encoder_decoder_attention_bias = (None, None)
-        if inputs is not None:
-            targets = inputs 
-            target_space = features["target_space_id"]
-            
-            encoder_output, encoder_decoder_attention_bias = self.encode(inputs, target_space, hparams)
-
-        else:
-            targets = tf.zeros_like(targets)
-
-        if fert_filename is not None:
-            tf.logging.info("Loading Fertility Model")
-            fert_model = FertilityModel(fert_filename, self._hparams.reinforce_delta if self._hparams.mode == tf.estimator.ModeKeys.TRAIN else 0.0)
-            features["inputs_fert_raw"], fertilities = tf.py_func(fert_model.fertilize, [features["inputs_raw"]], [tf.int32, tf.int32])
-            features["inputs_fert_raw"] =  tf.reshape(features["inputs_fert_raw"], tf.shape(features["inputs_raw"]))
-            def reinforce(reward):
-                return tf.py_func(fert_model.reinforce, [features["inputs_raw"], fertilities, reward], tf.int64)
-
-        else:
-            tf.logging.info("Using DQN fertility model")
-            fert_model = DQNFertility(max_fertility=5, hparams=self._hparams)
-            features["inputs_fert_raw"], fertilities = fert_model.fertilise(inputs, features["inputs_raw"])            
-#            features["inputs_fert_raw"] = features["inputs_raw"] #WTF BEN
-            features["inputs_fert_raw"] =  tf.reshape(features["inputs_fert_raw"], tf.shape(features["inputs_raw"]))
-            def reinforce(reward):
-                return fert_model.reinforce_op(fertilities, reward)
-
-        with tf.variable_scope(tf.VariableScope(True)):
-            with tf.variable_scope(target_modality.name, reuse=True):
-                features["inputs_fert"] = target_modality.bottom(features["inputs_fert_raw"])
-            
-        inputs = common_layers.flatten4d3d(features["inputs_fert"])
-        
-        decoder_self_attention_bias = (
-            common_attention.attention_bias_lower_triangle(tf.shape(inputs)[1]))
-        decoder_input = common_attention.add_timing_signal_1d(tf.nn.dropout(inputs, 1-hparams.z_temp))
-
-        decode_out = self.decode(decoder_input, encoder_output,
-                                 encoder_decoder_attention_bias,
-                                 tf.ones_like(decoder_self_attention_bias), hparams)
+        decode_out = generator(inputs, hparams, target_modality, hparams.mode == tf.estimator.ModeKeys.TRAIN, "Generator")
 
         with tf.variable_scope(tf.VariableScope(True)):
             with tf.variable_scope(target_modality.name + "/shared", reuse=True):
@@ -235,13 +278,14 @@ class TransformerGAN(Transformer):
         discrim_features = tf.gather(trans_embeddings, features["targets_raw"])
         discrim_features = tf.reshape(discrim_features, tf.shape(original_targets))
 
-        projected_truth = tf.matmul(tf.reshape(discrim_features, [-1, hparams.hidden_size]),tf.stop_gradient(embeddings), transpose_b=True)
+        projected_truth = tf.matmul(tf.reshape(discrim_features, [-1, hparams.hidden_size]),
+                                    tf.stop_gradient(embeddings), transpose_b=True)
 
         trans_embed_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                labels=tf.reshape(features["targets_raw"], [-1]),
-                logits=projected_truth,
-                name="trans_embed_loss"
-            )
+            labels=tf.reshape(features["targets_raw"], [-1]),
+            logits=projected_truth,
+            name="trans_embed_loss"
+        )
         discrim_features += tf.random_normal(tf.shape(discrim_features), stddev=0.1)
 
         d_real = discriminator(discrim_features, features["inputs"], usage="real", hparams=self._hparams)
@@ -260,10 +304,11 @@ class TransformerGAN(Transformer):
             slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), reduction_indices=[1, 2, 3]))
             gradient_penalty = tf.reduce_mean((slopes - 1.) ** 2) * hparams.lipschitz_mult
 
-        d_fake = discriminator(decode_out, features["inputs"], usage="fake", hparams=self._hparams, grad_pen=gradient_penalty, reuse=True)
+        d_fake = discriminator(decode_out, features["inputs"], usage="fake", hparams=self._hparams, reuse=True)
         tf.summary.scalar("gen_score", tf.reduce_mean(d_fake))
         d_loss = tf.reduce_mean(d_fake - d_real)
-        d_real_cycled = discriminator(tf.random_shuffle(discrim_features), features["inputs"], usage="real", hparams=self._hparams, reuse=True)
+        d_real_cycled = discriminator(tf.random_shuffle(discrim_features), features["inputs"], usage="real",
+                                      hparams=self._hparams, reuse=True)
         d_loss_cycle = tf.reduce_mean(d_real_cycled - d_real)
 
         if hparams.ganmode == "wgan":
@@ -284,14 +329,12 @@ class TransformerGAN(Transformer):
             with tf.variable_scope(target_modality.name, reuse=True):
                 logits = target_modality.top(decode_out, None)
                 sample = common_layers.sample_with_temperature(logits, 0.0)
-        gleu_score = tf_decomposed_gleu(features["targets_raw"], sample, fertilities[0])
-#        tf.summary.scalar("gleu_score", tf.reduce_mean(tf.reduce_sum(gleu_score, axis=-1)))
+
         losses = {
             "discriminator": d_loss,
             "lipschitz-penalty": gradient_penalty,
             "trans_embed_loss": trans_embed_loss,
             "semantic_reg": d_loss_cycle * 150,
-            "reinforce_fert": tf.reduce_mean(reinforce(d_fake*hparams.reinforce_delta))
         }
         if self._hparams.mode == tf.estimator.ModeKeys.PREDICT:
             return decode_out, d_fake
@@ -299,9 +342,9 @@ class TransformerGAN(Transformer):
         return decode_out, losses
 
     def model_fn(self, features, **kwargs):
-        features["inputs"], features["targets"] = common_layers.pad_to_same_length(features["inputs"], features["targets"])
-        return super(TransformerGAN, self).model_fn(features, **kwargs)
-        
+        features["inputs"], features["targets"] = common_layers.pad_to_same_length(features["inputs"],
+                                                                                   features["targets"])
+        return super(LstmGAN, self).model_fn(features, **kwargs)
 
     def _fast_decode(self,
                      features,
@@ -332,42 +375,38 @@ class TransformerGAN(Transformer):
 
         modality = self._problem_hparams.target_modality
 
-        features["inputs"] = tf.tile(features["inputs"], [beam_size]+[1]*(len(features["inputs"].get_shape().as_list())-1))
+        features["inputs"] = tf.tile(features["inputs"],
+                                     [beam_size] + [1] * (len(features["inputs"].get_shape().as_list()) - 1))
         features["inputs_raw"] = inputs = features["inputs"]
         inputs = tf.expand_dims(inputs, axis=1)
         if len(inputs.shape) < 5:
             inputs = tf.expand_dims(inputs, axis=4)
         s = tf.shape(inputs)
         inputs = tf.reshape(inputs, [s[0] * s[1], s[2], s[3], s[4]])
-#        inputs = tf.tile(inputs, [beam_size,1,1,1])
         features["inputs_raw"] = inputs
 
         batch_size = tf.shape(inputs)[0]
         decode_length = tf.shape(inputs)[1] + decode_length
         initial_ids = tf.zeros([batch_size, decode_length, 1, modality._body_input_depth], dtype=tf.float32)
-        
+
         features["targets"] = initial_ids
         features["targets_raw"] = tf.zeros([batch_size, decode_length, 1, 1], dtype=tf.int32)
 
         features["targets_raw"], inputs = common_layers.pad_to_same_length(features["targets_raw"], inputs)
 
-        smoother_decoder = SmoothOutput(self._hparams.lang_model_file, self._hparams.lang_model_data, self._hparams.problems[0].vocabulary["targets"])
-        
+        smoother_decoder = SmoothOutput(self._hparams.lang_model_file, self._hparams.lang_model_data,
+                                        self._hparams.problems[0].vocabulary["targets"])
+
         with tf.variable_scope(modality.name, reuse=None):
             features["inputs"] = modality.bottom(inputs)
 
-        feats_out = []
-        losses_out = []
-
-
-        
         with tf.variable_scope("body", reuse=None):
             feats, losses = self.model_fn_body(features)
             feats = tf.reshape(feats, tf.concat([[beam_size, batch_sz], tf.shape(feats)[1:]], axis=0))
             losses = tf.reshape(losses, tf.concat([[beam_size, batch_sz], tf.shape(losses)[1:]], axis=0))
 
-        top_for_each_batch  = tf.squeeze(tf.argmax(losses, 0, output_type=tf.int32), [-1])
-        
+        top_for_each_batch = tf.squeeze(tf.argmax(losses, 0, output_type=tf.int32), [-1])
+
         indices = tf.transpose(tf.stack([top_for_each_batch, tf.range(batch_sz)]))
         gathered = tf.gather_nd(feats, indices)
         body_out = tf.reshape(gathered, tf.shape(feats)[1:]), None
@@ -381,10 +420,6 @@ class TransformerGAN(Transformer):
         return smoother_decoder.decode_sequence(logits), None
 
 
-        
-#        return common_layers.sample_with_temperature(logits, 0.0), None
-
-
 @registry.register_hparams
 def transformer_gan_base():
     hparams = transformer_base_single_gpu()
@@ -396,8 +431,8 @@ def transformer_gan_base():
     hparams.optimizer = "RMSProp"
     hparams.summarize_grads = False
     hparams.clip_grad_norm = 1000.0
-    hparams.num_decoder_layers = 6
-    hparams.num_encoder_layers = 6
+    hparams.num_decoder_layers = 4
+    hparams.num_encoder_layers = 4
     hparams.max_length = 600
     hparams.layer_prepostprocess_dropout = 0.1
     hparams.attention_dropout = 0.1
@@ -421,6 +456,7 @@ def transformer_gan_base():
     hparams.add_hparam("fertility_filename", "ENG_FR.alignfertility_model.pkl")
     return hparams
 
+
 @registry.register_hparams
 def transformer_gan_base_ro():
     hparams = transformer_gan_base()
@@ -431,6 +467,7 @@ def transformer_gan_base_ro():
     hparams.add_hparam("lang_model_data", "/root/code/t2t_data/t2t_datagen/ro-en-lang_data.txt")
     return hparams
 
+
 @registry.register_hparams
 def transformer_gan_base_ro_reinforce():
     hparams = transformer_gan_base_ro()
@@ -439,14 +476,16 @@ def transformer_gan_base_ro_reinforce():
     hparams.fertility_filename = None
     return hparams
 
+
 @registry.register_hparams
 def transformer_gan_fat_ro_reinforce():
     hparams = transformer_gan_base_ro_reinforce()
     hparams.num_heads = 16
     hparams.hidden_size = 1024
     hparams.filter_size = 4096
-    
+
     return hparams
+
 
 @registry.register_hparams
 def transformer_gan_german():
@@ -461,12 +500,13 @@ def transformer_gan_german():
     hparams.ganmode = "wgan-gp"
     return hparams
 
+
 @registry.register_hparams
 def transformer_gan_base_mini():
     hparams = transformer_gan_base()
     hparams.hidden_size = 128
     return hparams
-    
+
 
 def decay_gradient(outputs, decay_period, final_val=1.00, summarize=True):
     masking = common_layers.inverse_lin_decay(decay_period)
@@ -480,12 +520,12 @@ def decay_gradient(outputs, decay_period, final_val=1.00, summarize=True):
 class GANSymbolModality(modalities.SymbolModality):
     def _get_weights(self, hidden_dim=None):
         if self._model_hparams.embedding_file is None:
-            initialiser = lambda name: tf.random_normal_initializer(0.0, hidden_dim**-0.5)
+            initialiser = lambda name: tf.random_normal_initializer(0.0, hidden_dim ** -0.5)
         else:
             with open(self._model_hparams.embedding_file, "rb") as fp:
                 embeddings = pickle.load(fp)
             tf.logging.info("Loading embeddings from file")
-            initialiser = lambda name: tf.constant(embeddings["symbol_modality_27927_512/shared/"+name+":0"])
+            initialiser = lambda name: tf.constant(embeddings["symbol_modality_27927_512/shared/" + name + ":0"])
 
         if hidden_dim is None:
             hidden_dim = self._body_input_depth
@@ -498,7 +538,8 @@ class GANSymbolModality(modalities.SymbolModality):
             shards.append(
                 tf.get_variable(
                     var_name,
-                    initializer=initialiser(var_name), shape=None if self._model_hparams.embedding_file is not None else [shard_size, hidden_dim]))
+                    initializer=initialiser(var_name),
+                    shape=None if self._model_hparams.embedding_file is not None else [shard_size, hidden_dim]))
         if num_shards == 1:
             ret = shards[0]
         else:
@@ -510,10 +551,10 @@ class GANSymbolModality(modalities.SymbolModality):
         else:
             weights = decay_gradient(ret, self._model_hparams.embed_decay_period, summarize=False)
         return weights
-        
-#    @property
-#    def targets_weights_fn(self):
-#        return common_layers.weights_all
+
+    #    @property
+    #    def targets_weights_fn(self):
+    #        return common_layers.weights_all
 
     def loss(self, *args, **kwargs):
         loss, weights = super(GANSymbolModality, self).loss(*args, **kwargs)
