@@ -383,6 +383,7 @@ def transformer_gan_base():
     hparams.attention_dropout = 0.1
     hparams.relu_dropout = 0.3
     hparams.label_smoothing = 0.0
+    hparams.add_hparam("reinit", False)
     hparams.add_hparam("ganmode", "wgan")
     hparams.add_hparam("num_compress_steps", 2)
     hparams.add_hparam("num_decode_steps", 0)
@@ -502,5 +503,17 @@ class GANSymbolModality(modalities.SymbolModality):
     #        return common_layers.weights_all
 
     def loss(self, *args, **kwargs):
+        def wipe_var(var_name):
+            do_not_wipe = ["Q_network", "discriminator", "symbol_modality"]
+            for n in do_not_wipe:
+                if n in var_name:
+                    return False
+            return True
+
         loss, weights = super(GANSymbolModality, self).loss(*args, **kwargs)
+        if self._model_hparams.reinit:
+            wipe_ops = [var.initializer for var in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES) if
+                        wipe_var(var.name)]
+            with tf.control_dependencies(wipe_ops):
+                loss = tf.identity(wipe_ops)
         return decay_gradient(loss, self._model_hparams.mle_decay_period, summarize=False), weights
