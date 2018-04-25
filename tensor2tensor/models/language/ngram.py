@@ -1,11 +1,5 @@
-# Natural Language Toolkit: Language Models
-#
-# Copyright (C) 2001-2014 NLTK Project
-# Authors: Steven Bird <stevenbird1@gmail.com>
-#          Daniel Blanchard <dblanchard@ets.org>
-#          Ilia Kurenkov <ilia.kurenkov@gmail.com>
-# URL: <http://nltk.org/>
-# For license information, see LICENSE.TXT
+# Based on the ngram model from an old version of NLTK, modified and fixed.
+
 from __future__ import unicode_literals
 
 from itertools import chain
@@ -23,6 +17,7 @@ from nltk.probability import LidstoneProbDist
 from nltk.probability import ConditionalProbDist, ELEProbDist
 import numpy as np
 
+
 def _estimator(fdist, *estimator_args, **estimator_kwargs):
     """
     Default estimator function using a SimpleGoodTuringProbDist.
@@ -31,23 +26,25 @@ def _estimator(fdist, *estimator_args, **estimator_kwargs):
     # can't be pickled either.
     return LidstoneProbDist(fdist, gamma=1, **estimator_kwargs)
 
+
 def prune(cfd, ngrams):
     count = 0
     thresh = 0
     while len(ngrams) > 4000000:
         thresh += 1
-        for c in tqdm(list(cfd.keys()), desc="Pruning with threshold = {} and {} total n_grams".format(thresh, len(ngrams))):
+        for c in tqdm(list(cfd.keys()),
+                      desc="Pruning with threshold = {} and {} total n_grams".format(thresh, len(ngrams))):
             for w in list(cfd[c].keys()):
                 if cfd[c][w] <= thresh:
                     n_gram = c + (w,)
                     ngrams.remove(n_gram)
                     del cfd[c][w]
-                    count +=1 
-                if sum(cfd[c])==0:
-                        del cfd[c]
+                    count += 1
+                if sum(cfd[c]) == 0:
+                    del cfd[c]
     print("Pruned a total of {} N-Grams".format(count))
     return cfd, ngrams
-    
+
 
 @compat.python_2_unicode_compatible
 class NgramModel:
@@ -126,8 +123,8 @@ class NgramModel:
         self._ngrams = set()
 
         # If given a list of strings instead of a list of lists, create enclosing list
-#        if (train is not None) and isinstance(train[0], compat.string_types):
-#            train = [train]
+        #        if (train is not None) and isinstance(train[0], compat.string_types):
+        #            train = [train]
 
         for i, sent in tqdm(enumerate(train()), desc="Fitting {}-gram model".format(n)):
             raw_ngrams = ngrams(sent, n, pad_left, pad_right)
@@ -155,7 +152,7 @@ class NgramModel:
             for ctxt in cfd.conditions():
                 backoff_ctxt = ctxt[1:]
                 backoff_total_pr = 0.0
-                total_observed_pr = 0.0##
+                total_observed_pr = 0.0  ##
 
                 # this is the subset of words that we OBSERVED following
                 # this context.
@@ -167,10 +164,10 @@ class NgramModel:
                     backoff_total_pr += self._backoff.prob(word, backoff_ctxt)
 
                 assert (0 <= total_observed_pr <= 1), total_observed_pr
-#                # beta is the remaining probability weight after we factor out
-#                # the probability of observed words.
-#                # As a sanity check, both total_observed_pr and backoff_total_pr
-#                # must be GE 0, since probabilities are never negative
+                #                # beta is the remaining probability weight after we factor out
+                #                # the probability of observed words.
+                #                # As a sanity check, both total_observed_pr and backoff_total_pr
+                #                # must be GE 0, since probabilities are never negative
                 beta = 1.0 - total_observed_pr
 
                 # backoff total has to be less than one, otherwise we get
@@ -182,9 +179,6 @@ class NgramModel:
 
     def _words_following(self, context, cond_freq_dist):
         yield from cond_freq_dist[context].keys()
-#        for ctxt, word in cond_freq_dist.iterkeys():
-#            if ctxt == context:
-#                yield word
 
     def prob(self, word, context):
         """
@@ -198,12 +192,9 @@ class NgramModel:
         context = tuple(context)
         context = self._lpad + context
         context = context[-self._n + 1:]
-#        print(context)
         if (context + (word,) in self._ngrams) or (self.is_unigram_model):
-#            print("In distrobution")
             return self._probdist[context].prob(word)
         else:
-#            print("Failed, backing off")
             return self._alpha(context) * self._backoff.prob(word, context[1:]) * 0.1
 
     def _alpha(self, context):
@@ -325,18 +316,17 @@ class LangModel:
 
     def predict(self, context, word):
         return np.log(self.lm.prob(word, context))
-    
+
+
 def cpdist(cfdist):
     return ConditionalProbDist(cfdist, ELEProbDist, 15000)
+
 
 if __name__ == "__main__":
     from nltk.corpus import brown
     from nltk.probability import LidstoneProbDist
     from nltk.probability import ConditionalProbDist, ELEProbDist
+
     lm = NgramModel(3, brown.words(), estimator=cpdist)
     print(lm.prob("hey", ['The', 'hey']))
     print(lm.prob("dog", ['The']))
-                
-
-
-
