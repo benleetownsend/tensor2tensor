@@ -35,7 +35,7 @@ class ProblemsTest(tf.test.TestCase):
     self.assertTrue(len(problems.available()) > 10)
 
     # Retrieve a problem by name
-    problem = problems.problem("translate_ende_wmt8k")
+    problem = problems.problem("translate_roen_wmt8k")
 
     # Access train and dev datasets through Problem
     train_dataset = problem.dataset(MODES.TRAIN)

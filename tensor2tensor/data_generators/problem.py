@@ -94,6 +94,8 @@ class SpaceID(object):
   STROKES = 29
   # Pickled Python
   PICKLED_PYTHON = 30
+  # Romanian Tokens
+  RO_TOK = 31
 
 
 def default_model_hparams():

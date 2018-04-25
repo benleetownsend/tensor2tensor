@@ -3,7 +3,7 @@ import tensorflow as tf
 import numpy as np
 from tensor2tensor.utils import registry
 
-fp = open("ENG_FR.align", "wt")
+fp = open("translate_roen_wmt8k.align", "wt")
 
 def write_to_file(inputs, targets):
     for inp, tar in zip(inputs, targets):

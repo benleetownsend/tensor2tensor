@@ -25,6 +25,7 @@ import os
 import random
 import stat
 import tarfile
+import zipfile
 
 # Dependency imports
 
@@ -322,9 +323,14 @@ def get_or_generate_vocab(data_dir, tmp_dir, vocab_filename, vocab_size,
 
         # Extract from tar if needed.
         if not tf.gfile.Exists(filepath):
-          read_type = "r:gz" if filename.endswith("tgz") else "r"
-          with tarfile.open(compressed_file, read_type) as corpus_tar:
-            corpus_tar.extractall(tmp_dir)
+          if filename.endswith("zip"):
+            zip_ref = zipfile.ZipFile(compressed_file, 'r')
+            zip_ref.extractall(tmp_dir)
+            zip_ref.close()
+          else:
+            read_type = "r:gz" if filename.endswith("tgz") else "r"
+            with tarfile.open(compressed_file, read_type) as corpus_tar:
+              corpus_tar.extractall(tmp_dir)
 
         # For some datasets a second extraction is necessary.
         if lang_file.endswith(".gz"):

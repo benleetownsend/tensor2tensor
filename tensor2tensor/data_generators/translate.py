@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import os
 import tarfile
+import zipfile
 
 # Dependency imports
 
@@ -203,10 +204,15 @@ def compile_data(tmp_dir, datasets, filename):
           _, src_column, trg_column, glob_pattern = dataset[1]
           filenames = tf.gfile.Glob(os.path.join(tmp_dir, glob_pattern))
           if not filenames:
-            # Capture *.tgz and *.tar.gz too.
-            mode = "r:gz" if compressed_filepath.endswith("gz") else "r"
-            with tarfile.open(compressed_filepath, mode) as corpus_tar:
-              corpus_tar.extractall(tmp_dir)
+            if compressed_filepath.endswith("zip"):
+              zip_ref = zipfile.ZipFile(compressed_filepath, 'r')
+              zip_ref.extractall(tmp_dir)
+              zip_ref.close()
+            else:
+              # Capture *.tgz and *.tar.gz too.
+              mode = "r:gz" if compressed_filepath.endswith("gz") else "r"
+              with tarfile.open(compressed_filepath, mode) as corpus_tar:
+                corpus_tar.extractall(tmp_dir)
             filenames = tf.gfile.Glob(os.path.join(tmp_dir, glob_pattern))
           for tsv_filename in filenames:
             if tsv_filename.endswith(".gz"):
