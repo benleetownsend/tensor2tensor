@@ -246,6 +246,8 @@ def transformer_gan_base():
   hparams.attention_dropout = 0.1
   hparams.relu_dropout = 0.3
   hparams.label_smoothing = 0.0
+  hparams.add_hparam("ar_beams", 1)
+  hparams.add_hparam("ar_alpha", 0.0)
   hparams.add_hparam("reinit", False)
   hparams.add_hparam("ganmode", "wgan")
   hparams.add_hparam("num_compress_steps", 2)
