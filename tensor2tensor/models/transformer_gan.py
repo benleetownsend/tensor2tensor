@@ -128,11 +128,11 @@ class TransformerGAN(Transformer):
 
     return decode_out, losses
 
-  def model_fn(self, features, **kwargs):
+  def model_fn(self, features, *args,  **kwargs):
     # Pads the values to the same length before theyre embedded by the model_fn.
     features["inputs"], features["targets"] = common_layers.pad_to_same_length(features["inputs"],
                                                                                features["targets"])
-    return super(TransformerGAN, self).model_fn(features, **kwargs)
+    return super(TransformerGAN, self).model_fn(features, *args, **kwargs)
 
   def eval_autoregressive(self,
                           features=None,
@@ -142,9 +142,6 @@ class TransformerGAN(Transformer):
     A slightly hacky way to get the model to use the lang model smoother when the model is in autoregressive mode.
     """
     raw_targets = features["targets"]
-    if self._hparams.ar_beams == 1:
-      return super(TransformerGAN, self).eval_autoregressive(features, decode_length)
-
     vocab_sz = self._problem_hparams.target_modality._vocab_size
     ids = self._fast_decode(features, decode_length,
                             beam_size=self._hparams.ar_beams,
