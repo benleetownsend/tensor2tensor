@@ -26,6 +26,9 @@ from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import expert_utils as eu
 from tensor2tensor.utils import modality
 from tensor2tensor.utils import registry
+from tensor2tensor.utils.gradient_manip import decay_gradient
+
+import pickle
 
 import tensorflow as tf
 
@@ -68,12 +71,12 @@ class SymbolModality(modality.Modality):
     shards = []
     for i in xrange(num_shards):
       shard_size = (self._vocab_size // num_shards) + (
-          1 if i < self._vocab_size % num_shards else 0)
+        1 if i < self._vocab_size % num_shards else 0)
       var_name = "weights_%d" % i
       shards.append(
-          tf.get_variable(
-              var_name, [shard_size, hidden_dim],
-              initializer=tf.random_normal_initializer(0.0, hidden_dim**-0.5)))
+        tf.get_variable(
+          var_name, [shard_size, hidden_dim],
+          initializer=tf.random_normal_initializer(0.0, hidden_dim ** -0.5)))
     if num_shards == 1:
       ret = shards[0]
     else:
@@ -88,7 +91,7 @@ class SymbolModality(modality.Modality):
       var = self._get_weights()
       ret = tf.gather(var, x)
       if self._model_hparams.multiply_embedding_mode == "sqrt_depth":
-        ret *= self._body_input_depth**0.5
+        ret *= self._body_input_depth ** 0.5
       ret *= tf.expand_dims(tf.to_float(tf.not_equal(x, 0)), -1)
       return ret
 
@@ -130,11 +133,11 @@ class SymbolModality(modality.Modality):
     with tf.variable_scope(scope_name, reuse=reuse):
       rank = len(body_output.get_shape().as_list())
       body_output_shape = [
-          common_layers.shape_dim(body_output, i) for i in range(rank)
+        common_layers.shape_dim(body_output, i) for i in range(rank)
       ]
       var = self._get_weights(body_output_shape[-1])
       if (self._model_hparams.factored_logits and
-          self._model_hparams.mode == tf.estimator.ModeKeys.TRAIN):
+              self._model_hparams.mode == tf.estimator.ModeKeys.TRAIN):
         # insert channels dimension
         body_output = tf.expand_dims(body_output, 3)
         logits = common_layers.FactoredTensor(body_output, var)
@@ -164,14 +167,14 @@ class CTCSymbolModality(SymbolModality):
       targets_mask = 1 - tf.to_int32(tf.equal(targets, 0))
       targets_lengths = tf.reduce_sum(targets_mask, axis=1)
       sparse_targets = tf.contrib.keras.backend.ctc_label_dense_to_sparse(
-          targets, targets_lengths)
+        targets, targets_lengths)
       xent = tf.nn.ctc_loss(
-          sparse_targets,
-          logits,
-          targets_lengths,
-          time_major=False,
-          preprocess_collapse_repeated=False,
-          ctc_merge_repeated=False)
+        sparse_targets,
+        logits,
+        targets_lengths,
+        time_major=False,
+        preprocess_collapse_repeated=False,
+        ctc_merge_repeated=False)
       weights = weights_fn(targets)
       return tf.reduce_sum(xent), tf.reduce_sum(weights)
 
@@ -198,12 +201,12 @@ class ImageModality(modality.Modality):
     with tf.variable_scope(self.name):
       # Reshape inputs to 2-d tensor and embed the RGB pixel values.
       ret = common_layers.embedding(
-          tf.to_int32(common_layers.flatten4d3d(inputs)),
-          self.top_dimensionality,
-          self._body_input_depth,
-          name="input_rgb_embedding")
+        tf.to_int32(common_layers.flatten4d3d(inputs)),
+        self.top_dimensionality,
+        self._body_input_depth,
+        name="input_rgb_embedding")
       if self._model_hparams.multiply_embedding_mode == "sqrt_depth":
-        ret *= self._body_input_depth**0.5
+        ret *= self._body_input_depth ** 0.5
 
       reshape_shape = [common_layers.shape_dim(inputs, i) for i in range(3)]
       reshape_shape.append(self._body_input_depth * 3)
@@ -212,9 +215,8 @@ class ImageModality(modality.Modality):
 
   def top(self, body_output, _):
     with tf.variable_scope("rgb_softmax"):
-
       reshape_shape = [
-          common_layers.shape_dim(body_output, i) for i in range(3)
+        common_layers.shape_dim(body_output, i) for i in range(3)
       ]
       dim = body_output.get_shape().as_list()[-1] // 3
       reshape_shape.extend([self._channels, dim])
@@ -230,7 +232,7 @@ class ImageModality(modality.Modality):
     # Call the default implementation, but weight 1.0 on 0s by default.
     # (Since we're processing images and so have no padding and some pixel 0s.)
     return super(ImageModality, self).loss(
-        top_out, targets, weights_fn=weights_fn)
+      top_out, targets, weights_fn=weights_fn)
 
 
 @registry.register_image_modality("image_identity_compress")
@@ -256,17 +258,17 @@ class ImageIdentityCompressModality(modality.Modality):
     with tf.variable_scope(name):
       inputs = common_layers.convert_rgb_to_real(inputs)
       ishape = tf.shape(inputs)
-      inputs = tf.reshape(inputs, [-1, ishape[1], ishape[2]*ishape[3], 1])
+      inputs = tf.reshape(inputs, [-1, ishape[1], ishape[2] * ishape[3], 1])
       inputs.set_shape([None, None, None, 1])
       # We compress RGB intensities for each pixel using a conv.
       x = common_layers.conv_block(
-          inputs,
-          self._body_input_depth, [((1, 1), (1, 3))],
-          first_relu=False,
-          padding="VALID",
-          strides=(1, 3),
-          force2d=True,
-          name="conv_input")
+        inputs,
+        self._body_input_depth, [((1, 1), (1, 3))],
+        first_relu=False,
+        padding="VALID",
+        strides=(1, 3),
+        force2d=True,
+        name="conv_input")
       return x
 
   def bottom(self, inputs):
@@ -282,12 +284,12 @@ class ImageIdentityCompressModality(modality.Modality):
       channels = self._model_hparams.num_channels
       batch = tf.shape(body_output)[0]
       x = common_layers.conv(
-          body_output,
-          hidden_dim*channels, (1, 1),
-          padding="VALID",
-          activation=tf.nn.relu,
-          name="decompress_conv")
-      x = tf.reshape(x, [batch, img_len, img_len*channels, hidden_dim])
+        body_output,
+        hidden_dim * channels, (1, 1),
+        padding="VALID",
+        activation=tf.nn.relu,
+        name="decompress_conv")
+      x = tf.reshape(x, [batch, img_len, img_len * channels, hidden_dim])
       x.set_shape([None, None, None, hidden_dim])
       x = common_layers.conv(x,
                              self.top_dimensionality,
@@ -300,7 +302,7 @@ class ImageIdentityCompressModality(modality.Modality):
     # Call the default implementation, but weight 1.0 on 0s by default.
     # (Since we're processing images and so have no padding and some pixel 0s.)
     return super(ImageIdentityCompressModality, self).loss(
-        top_out, targets, weights_fn=weights_fn)
+      top_out, targets, weights_fn=weights_fn)
 
 
 @registry.register_audio_modality("default")
@@ -322,26 +324,26 @@ class AudioModality(modality.Modality):
           # Typically audio samples are >100k samples in length and have a width
           # of 2 or 4. Mono audio has a single channel while stereo has 2.
           y = common_layers.separable_conv_block(
-              x,
-              filters, [((1, 1), (3, 3)), ((1, 1), (3, 3))],
-              first_relu=True,
-              padding="SAME",
-              force2d=True,
-              name="sep_conv_block")
+            x,
+            filters, [((1, 1), (3, 3)), ((1, 1), (3, 3))],
+            first_relu=True,
+            padding="SAME",
+            force2d=True,
+            name="sep_conv_block")
           y = common_layers.pool(y, (3, 3), "MAX", "SAME", strides=(2, 2))
           return y + common_layers.conv_block(
-              x,
-              filters, [((1, 1), (1, 1))],
-              padding="SAME",
-              strides=(2, 2),
-              first_relu=res_relu,
-              force2d=True,
-              name="res_conv0")
+            x,
+            filters, [((1, 1), (1, 1))],
+            padding="SAME",
+            strides=(2, 2),
+            first_relu=res_relu,
+            force2d=True,
+            name="res_conv0")
 
       x = tf.to_float(inputs) / 255.
       x.set_shape([None, None, None, 1])
       for i in xrange(self._model_hparams.audio_compression):
-        x = xnet_resblock(x, 2**(i + 1), True, "compress_block_%d" % i)
+        x = xnet_resblock(x, 2 ** (i + 1), True, "compress_block_%d" % i)
       return xnet_resblock(x, self._body_input_depth, False,
                            "compress_block_final")
 
@@ -365,27 +367,27 @@ class AudioSpectralModality(modality.Modality):
           # We only stride along the length dimension to preserve the spectral
           # bins (which are tiny in dimensionality relative to length)
           y = common_layers.separable_conv_block(
-              x,
-              filters, [((1, 1), (3, 3)), ((1, 1), (3, 3))],
-              first_relu=True,
-              padding="SAME",
-              force2d=True,
-              name="sep_conv_block")
+            x,
+            filters, [((1, 1), (3, 3)), ((1, 1), (3, 3))],
+            first_relu=True,
+            padding="SAME",
+            force2d=True,
+            name="sep_conv_block")
           y = common_layers.pool(y, (3, 3), "MAX", "SAME", strides=(2, 1))
           return y + common_layers.conv_block(
-              x,
-              filters, [((1, 1), (1, 1))],
-              padding="SAME",
-              strides=(2, 1),
-              first_relu=res_relu,
-              force2d=True,
-              name="res_conv0")
+            x,
+            filters, [((1, 1), (1, 1))],
+            padding="SAME",
+            strides=(2, 1),
+            first_relu=res_relu,
+            force2d=True,
+            name="res_conv0")
 
       # Bitcast back from int32
       x = tf.bitcast(inputs, tf.float32)
       x.set_shape([None, None, None, 1])
       for i in xrange(self._model_hparams.audio_compression):
-        x = xnet_resblock(x, 2**(i + 1), True, "compress_block_%d" % i)
+        x = xnet_resblock(x, 2 ** (i + 1), True, "compress_block_%d" % i)
       return xnet_resblock(x, self._body_input_depth, False,
                            "compress_block_final")
 
@@ -406,16 +408,16 @@ class ClassLabelModality(modality.Modality):
   def bottom(self, x):
     with tf.variable_scope(self.name):
       return common_layers.embedding(
-          x,
-          self._vocab_size,
-          self._body_input_depth,
-          multiplier=self._body_input_depth**0.5 if
-          self._model_hparams.multiply_embedding_mode == "sqrt_depth" else 1.0)
+        x,
+        self._vocab_size,
+        self._body_input_depth,
+        multiplier=self._body_input_depth ** 0.5 if
+        self._model_hparams.multiply_embedding_mode == "sqrt_depth" else 1.0)
 
   def targets_bottom(self, x):
     with tf.variable_scope(self.name):
       return tf.zeros(
-          [common_layers.shape_dim(x, 0), 1, 1, self._body_input_depth])
+        [common_layers.shape_dim(x, 0), 1, 1, self._body_input_depth])
 
   def top(self, body_output, _):
     """Transform inputs from model space to target space.
@@ -438,7 +440,7 @@ class ClassLabelModality(modality.Modality):
     # Call the default implementation, but weight 1.0 on 0s by default.
     # (Since we're processing images and so have no padding and some pixel 0s.)
     return super(ClassLabelModality, self).loss(
-        top_out, targets, weights_fn=weights_fn)
+      top_out, targets, weights_fn=weights_fn)
 
 
 @registry.register_generic_modality("default")
@@ -532,7 +534,7 @@ class IdentityModalityNoPad(modality.Modality):
     # Call the default implementation, but weight 1.0 on 0s by default.
     # (Since we're processing images and so have no padding and some pixel 0s.)
     return super(IdentityModalityNoPad, self).loss(
-        top_out, targets, weights_fn=weights_fn)
+      top_out, targets, weights_fn=weights_fn)
 
 
 @registry.register_image_modality("no_loss")
@@ -552,3 +554,62 @@ class NoLossModality(modality.Modality):
   def loss_sharded(self, sharded_top_out, sharded_targets, data_parallelism):
     """Return nothing."""
     return tf.constant(0.0, tf.float32)
+
+
+@registry.register_symbol_modality("GAN")
+class GANSymbolModality(SymbolModality):
+  def _get_weights(self, hidden_dim=None):
+    if self._model_hparams.embedding_file is None:
+      initialiser = lambda name: tf.random_normal_initializer(0.0, hidden_dim ** -0.5)
+    else:
+      with open(self._model_hparams.embedding_file, "rb") as fp:
+        embeddings = pickle.load(fp)
+      tf.logging.info("Loading embeddings from file")
+      initialiser = lambda name: tf.constant(embeddings["symbol_modality_27927_512/shared/" + name + ":0"])
+
+    if hidden_dim is None:
+      hidden_dim = self._body_input_depth
+    num_shards = self._model_hparams.symbol_modality_num_shards
+    shards = []
+    for i in xrange(num_shards):
+      shard_size = (self._vocab_size // num_shards) + (
+        1 if i < self._vocab_size % num_shards else 0)
+      var_name = "weights_%d" % i
+      shards.append(
+        tf.get_variable(
+          var_name,
+          initializer=initialiser(var_name),
+          shape=None if self._model_hparams.embedding_file is not None else [shard_size, hidden_dim]))
+    if num_shards == 1:
+      ret = shards[0]
+    else:
+      ret = tf.concat(shards, 0)
+    ret = eu.convert_gradient_to_tensor(ret)
+
+    if type(ret) == list:
+      weights = [decay_gradient(w, self._model_hparams.embed_decay_period, summarize=False) for w in ret]
+    else:
+      weights = decay_gradient(ret, self._model_hparams.embed_decay_period, summarize=False)
+    return weights
+
+  #    @property
+  #    def targets_weights_fn(self):
+  #        return common_layers.weights_all
+
+  #  TODO(Ben) uncomment the preceding lines when merged with a newer version of tensor2tensor
+
+  def loss(self, *args, **kwargs):
+    def wipe_var(var_name):
+      do_not_wipe = ["Q_network", "discriminator", "symbol_modality"]
+      for n in do_not_wipe:
+        if n in var_name:
+          return False
+      return True
+
+    loss, weights = super(GANSymbolModality, self).loss(*args, **kwargs)
+    if self._model_hparams.reinit:
+      wipe_ops = [var.initializer for var in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES) if
+                  wipe_var(var.name)]
+      with tf.control_dependencies(wipe_ops):
+        loss = tf.identity(wipe_ops)
+    return decay_gradient(loss, self._model_hparams.mle_decay_period, summarize=False), weights

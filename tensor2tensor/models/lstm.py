@@ -26,6 +26,8 @@ from tensor2tensor.layers import common_layers
 from tensor2tensor.utils import registry
 from tensor2tensor.utils import t2t_model
 
+from tensorflow.python.ops.rnn import _transpose_batch_time
+
 import tensorflow as tf
 
 
@@ -34,17 +36,17 @@ def lstm(inputs, hparams, train, name, initial_state=None):
 
   def dropout_lstm_cell():
     return tf.contrib.rnn.DropoutWrapper(
-        tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
-        input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
+      tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
+      input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
 
   layers = [dropout_lstm_cell() for _ in range(hparams.num_hidden_layers)]
   with tf.variable_scope(name):
     return tf.nn.dynamic_rnn(
-        tf.contrib.rnn.MultiRNNCell(layers),
-        inputs,
-        initial_state=initial_state,
-        dtype=tf.float32,
-        time_major=False)
+      tf.contrib.rnn.MultiRNNCell(layers),
+      inputs,
+      initial_state=initial_state,
+      dtype=tf.float32,
+      time_major=False)
 
 
 def lstm_attention_decoder(inputs, hparams, train, name, initial_state,
@@ -53,8 +55,8 @@ def lstm_attention_decoder(inputs, hparams, train, name, initial_state,
 
   def dropout_lstm_cell():
     return tf.contrib.rnn.DropoutWrapper(
-        tf.nn.rnn_cell.BasicLSTMCell(hparams.hidden_size),
-        input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
+      tf.nn.rnn_cell.BasicLSTMCell(hparams.hidden_size),
+      input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
 
   layers = [dropout_lstm_cell() for _ in range(hparams.num_hidden_layers)]
   if hparams.attention_mechanism == "luong":
@@ -65,34 +67,147 @@ def lstm_attention_decoder(inputs, hparams, train, name, initial_state,
     raise ValueError("Unknown hparams.attention_mechanism = %s, must be "
                      "luong or bahdanu." % hparams.attention_mechanism)
   attention_mechanism = attention_mechanism_class(
-      hparams.hidden_size, encoder_outputs)
+    hparams.hidden_size, encoder_outputs)
 
   cell = tf.contrib.seq2seq.AttentionWrapper(
-      tf.nn.rnn_cell.MultiRNNCell(layers),
-      [attention_mechanism]*hparams.num_heads,
-      attention_layer_size=[hparams.attention_layer_size]*hparams.num_heads,
-      output_attention=(hparams.output_attention == 1))
+    tf.nn.rnn_cell.MultiRNNCell(layers),
+    [attention_mechanism] * hparams.num_heads,
+    attention_layer_size=[hparams.attention_layer_size] * hparams.num_heads,
+    output_attention=(hparams.output_attention == 1))
 
   batch_size = inputs.get_shape()[0].value
   if batch_size is None:
     batch_size = tf.shape(inputs)[0]
 
   initial_state = cell.zero_state(batch_size, tf.float32).clone(
-      cell_state=initial_state)
+    cell_state=initial_state)
 
   with tf.variable_scope(name):
     output, state = tf.nn.dynamic_rnn(
-        cell,
-        inputs,
-        initial_state=initial_state,
-        dtype=tf.float32,
-        time_major=False)
+      cell,
+      inputs,
+      initial_state=initial_state,
+      dtype=tf.float32,
+      time_major=False)
 
     # For multi-head attention project output back to hidden size
     if hparams.output_attention == 1 and hparams.num_heads > 1:
       output = tf.layers.dense(output, hparams.hidden_size)
 
     return output, state
+
+
+def lstm_bid_encoder(inputs, hparams, train, name):
+  """Bidirectional LSTM for encoding inputs that are [batch x time x size]."""
+
+  def dropout_lstm_cell():
+    return tf.contrib.rnn.DropoutWrapper(
+      tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size // 2),
+      input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
+
+  with tf.variable_scope(name):
+    cell_fw = tf.contrib.rnn.MultiRNNCell(
+      [dropout_lstm_cell() for _ in range(hparams.num_encoder_layers)])
+
+    cell_bw = tf.contrib.rnn.MultiRNNCell(
+      [dropout_lstm_cell() for _ in range(hparams.num_encoder_layers)])
+
+    ((encoder_fw_outputs, encoder_bw_outputs),
+     (encoder_fw_state, encoder_bw_state)) = tf.nn.bidirectional_dynamic_rnn(
+      cell_fw=cell_fw,
+      cell_bw=cell_bw,
+      inputs=inputs,
+      dtype=tf.float32,
+      time_major=False)
+
+    encoder_outputs = tf.concat((encoder_fw_outputs, encoder_bw_outputs), 2)
+    encoder_states = []
+
+    for i in range(hparams.num_encoder_layers):
+      if isinstance(encoder_fw_state[i], tf.contrib.rnn.LSTMStateTuple):
+        encoder_state_c = tf.concat(
+          values=(encoder_fw_state[i].c, encoder_bw_state[i].c),
+          axis=1,
+          name="encoder_fw_state_c")
+        encoder_state_h = tf.concat(
+          values=(encoder_fw_state[i].h, encoder_bw_state[i].h),
+          axis=1,
+          name="encoder_fw_state_h")
+        encoder_state = tf.contrib.rnn.LSTMStateTuple(
+          c=encoder_state_c, h=encoder_state_h)
+      elif isinstance(encoder_fw_state[i], tf.Tensor):
+        encoder_state = tf.concat(
+          values=(encoder_fw_state[i], encoder_bw_state[i]),
+          axis=1,
+          name="bidirectional_concat")
+
+      encoder_states.append(encoder_state)
+
+    encoder_states = tuple(encoder_states)
+    return encoder_outputs, encoder_states
+
+
+def auto_regressive_bi_attn_lstm_s2s(inputs, hparams, modality, train, name):
+  inputs = tf.squeeze(inputs, 2)
+
+  def get_decoder_loop_fn(sequence_length, initial_state):
+    def loop_fn(time, cell_output, cell_state, loop_state):
+
+      emit_output = cell_output
+      if cell_output is None:
+        next_cell_state = initial_state
+        next_input = tf.random_uniform(shape=[tf.shape(inputs)[0], hparams.hidden_size], minval=-0.00,
+                                       maxval=0.00,
+                                       dtype=tf.float32)  # GO
+      else:
+        with tf.variable_scope(tf.VariableScope(True)):
+          with tf.variable_scope(modality.name, reuse=True):
+            word_probs = tf.nn.softmax(modality.top(cell_output, None), dim=-1)
+            word_ids = common_layers.sample_with_temperature(word_probs, hparams.z_temp)
+            word_ids = tf.reshape(word_ids, [-1, 1, 1, 1])
+            next_input = tf.squeeze(modality.bottom(word_ids), [1, 2])
+        next_cell_state = cell_state
+
+      elements_finished = (time >= sequence_length)
+      next_loop_state = None
+      return elements_finished, next_input, next_cell_state, emit_output, next_loop_state
+
+    return loop_fn
+
+  def dropout_lstm_cell():
+    return tf.contrib.rnn.DropoutWrapper(
+      tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
+      input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
+
+  with tf.variable_scope("decoder_lstms"):
+    decoder_layers = [dropout_lstm_cell() for _ in range(hparams.num_decoder_layers)]
+
+  attention_mechanism_class = tf.contrib.seq2seq.LuongAttention
+
+  with tf.variable_scope(name):
+    encoder_outputs, encoder_final_state = lstm_bid_encoder(inputs, hparams, train, name + "Encoder")
+
+    attention_mechanism = attention_mechanism_class(hparams.hidden_size, encoder_outputs)
+
+    attn_cell = tf.contrib.seq2seq.AttentionWrapper(
+      tf.nn.rnn_cell.MultiRNNCell(decoder_layers),
+      attention_mechanism,
+      attention_layer_size=hparams.hidden_size,
+      output_attention=True)
+
+    batch_size = inputs.get_shape()[0].value
+    if batch_size is None:
+      batch_size = tf.shape(inputs)[0]
+    initial_state = attn_cell.zero_state(batch_size, tf.float32).clone(
+      cell_state=encoder_final_state)
+
+    with tf.variable_scope("decoder_lstms"):
+      outputs, _, _ = tf.nn.raw_rnn(attn_cell,
+                                    get_decoder_loop_fn(tf.shape(inputs)[1], initial_state))
+
+    outputs = _transpose_batch_time(outputs.stack())
+
+  return tf.expand_dims(outputs, 2)
 
 
 def lstm_seq2seq_internal(inputs, targets, hparams, train):
@@ -103,17 +218,17 @@ def lstm_seq2seq_internal(inputs, targets, hparams, train):
       inputs = common_layers.flatten4d3d(inputs)
       # LSTM encoder.
       _, final_encoder_state = lstm(
-          tf.reverse(inputs, axis=[1]), hparams, train, "encoder")
+        tf.reverse(inputs, axis=[1]), hparams, train, "encoder")
     else:
       final_encoder_state = None
     # LSTM decoder.
     shifted_targets = common_layers.shift_right(targets)
     decoder_outputs, _ = lstm(
-        common_layers.flatten4d3d(shifted_targets),
-        hparams,
-        train,
-        "decoder",
-        initial_state=final_encoder_state)
+      common_layers.flatten4d3d(shifted_targets),
+      hparams,
+      train,
+      "decoder",
+      initial_state=final_encoder_state)
     return tf.expand_dims(decoder_outputs, axis=2)
 
 
@@ -124,18 +239,17 @@ def lstm_seq2seq_internal_attention(inputs, targets, hparams, train):
     inputs = common_layers.flatten4d3d(inputs)
     # LSTM encoder.
     encoder_outputs, final_encoder_state = lstm(
-        tf.reverse(inputs, axis=[1]), hparams, train, "encoder")
+      tf.reverse(inputs, axis=[1]), hparams, train, "encoder")
     # LSTM decoder with attention
     shifted_targets = common_layers.shift_right(targets)
     decoder_outputs, _ = lstm_attention_decoder(
-        common_layers.flatten4d3d(shifted_targets), hparams, train, "decoder",
-        final_encoder_state, encoder_outputs)
+      common_layers.flatten4d3d(shifted_targets), hparams, train, "decoder",
+      final_encoder_state, encoder_outputs)
     return tf.expand_dims(decoder_outputs, axis=2)
 
 
 @registry.register_model
 class LSTMSeq2seq(t2t_model.T2TModel):
-
   def model_fn_body(self, features):
     # TODO(lukaszkaiser): investigate this issue and repair.
     if self._hparams.initializer == "orthogonal":
@@ -147,14 +261,13 @@ class LSTMSeq2seq(t2t_model.T2TModel):
 
 @registry.register_model
 class LSTMSeq2seqAttention(t2t_model.T2TModel):
-
   def model_fn_body(self, features):
     # TODO(lukaszkaiser): investigate this issue and repair.
     if self._hparams.initializer == "orthogonal":
       raise ValueError("LSTM models fail with orthogonal initializer.")
     train = self._hparams.mode == tf.estimator.ModeKeys.TRAIN
     return lstm_seq2seq_internal_attention(
-        features.get("inputs"), features["targets"], self._hparams, train)
+      features.get("inputs"), features["targets"], self._hparams, train)
 
 
 @registry.register_hparams
