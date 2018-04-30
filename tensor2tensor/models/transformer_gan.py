@@ -122,10 +122,6 @@ class TransformerGAN(Transformer):
       "reinforce_fert": tf.reduce_mean(reinforce(d_fake * hparams.reinforce_delta))
     }
 
-    # If the model is being predicted with, ignore most of the losses and just return the discriminator loss.
-    if self._hparams.mode in [tf.estimator.ModeKeys.PREDICT, tf.estimator.ModeKeys.EVAL]:
-      return decode_out, d_fake
-
     return decode_out, losses
 
   def model_fn(self, features, *args,  **kwargs):
@@ -207,10 +203,11 @@ class TransformerGAN(Transformer):
 
     with tf.variable_scope("body", reuse=None):
       feats, losses = self.model_fn_body(features)
+      d_loss = losses["discriminator"]
       feats = tf.reshape(feats, tf.concat([[beam_size, batch_sz], tf.shape(feats)[1:]], axis=0))
-      losses = tf.reshape(losses, tf.concat([[beam_size, batch_sz], tf.shape(losses)[1:]], axis=0))
+      d_loss = tf.reshape(losses, tf.concat([[beam_size, batch_sz], tf.shape(d_loss)[1:]], axis=0))
 
-    top_for_each_batch = tf.squeeze(tf.argmax(losses, 0, output_type=tf.int32), [-1])
+    top_for_each_batch = tf.squeeze(tf.argmax(d_loss, 0, output_type=tf.int32), [-1])
     indices = tf.transpose(tf.stack([top_for_each_batch, tf.range(batch_sz)]))
     gathered = tf.gather_nd(feats, indices)
 
