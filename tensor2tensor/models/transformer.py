@@ -161,6 +161,24 @@ class Transformer(t2t_model.T2TModel):
     decoded_ids, _ = self._fast_decode(features, decode_length)
     return decoded_ids, None, None
 
+  def eval_autoregressive(self,
+                          features=None,
+                          decode_length=50):
+    if self._hparams.ar_beams == 1:
+      return super().eval_autoregressive(features, decode_length)
+
+    vocab_sz = self._problem_hparams.target_modality._vocab_size
+    ids = self._fast_decode(features, decode_length,
+                             beam_size=self._hparams.ar_beams,
+                             top_beams=1,
+                             alpha=self._hparams.ar_alpha)[0]
+
+    fake_logits = tf.one_hot(ids, vocab_sz)
+    fake_logits = tf.expand_dims(fake_logits, 2)
+    fake_logits = tf.expand_dims(fake_logits, 3)
+    print(fake_logits)
+    return fake_logits, dict()
+
   def _beam_decode(self, features, decode_length, beam_size, top_beams,
                    alpha):
     """Beam search decoding.
@@ -647,6 +665,8 @@ def transformer_base_v1():
   hparams.add_hparam("use_pad_remover", True)
   hparams.add_hparam("self_attention_type", "dot_product")
   hparams.add_hparam("max_relative_position", 0)
+  hparams.add_hparam("ar_beams",5)
+  hparams.add_hparam("ar_alpha",0.6)
   return hparams
 
 

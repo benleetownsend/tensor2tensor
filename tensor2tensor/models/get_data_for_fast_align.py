@@ -1,4 +1,4 @@
-from tensor2tensor.models.transformer_gan_multistep import TransformerGAN
+from tensor2tensor.models.transformer_gan import TransformerGAN
 import tensorflow as tf
 import numpy as np
 from tensor2tensor.utils import registry
