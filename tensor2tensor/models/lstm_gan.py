@@ -27,7 +27,7 @@ def lstm_bid_encoder(inputs, hparams, train, name):
 
     def dropout_lstm_cell():
         return tf.contrib.rnn.DropoutWrapper(
-            tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size),
+            tf.contrib.rnn.BasicLSTMCell(hparams.hidden_size//2),
             input_keep_prob=1.0 - hparams.dropout * tf.to_float(train))
 
     with tf.variable_scope(name):
@@ -124,9 +124,15 @@ def generator(inputs, hparams, modality, train, name):
             attention_layer_size=hparams.hidden_size,
             output_attention=True)
 
+        batch_size = inputs.get_shape()[0].value
+        if batch_size is None:
+            batch_size = tf.shape(inputs)[0]
+        initial_state = attn_cell.zero_state(batch_size, tf.float32).clone(
+            cell_state=encoder_final_state)
+
         with tf.variable_scope("decoder_lstms"):
             outputs, _, _ = tf.nn.raw_rnn(attn_cell,
-                                          get_decoder_loop_fn(tf.shape(inputs)[1], encoder_final_state))
+                                          get_decoder_loop_fn(tf.shape(inputs)[1], initial_state))
 
         outputs = _transpose_batch_time(outputs.stack())
 
@@ -394,8 +400,13 @@ class LstmGAN(t2t_model.T2TModel):
 
         features["targets_raw"], inputs = common_layers.pad_to_same_length(features["targets_raw"], inputs)
 
-        smoother_decoder = SmoothOutput(self._hparams.lang_model_file, self._hparams.lang_model_data,
+        if self._hparams.lang_model_file is not None:
+            smooth_decoder = SmoothOutput(self._hparams.lang_model_file, self._hparams.lang_model_data,
                                         self._hparams.problems[0].vocabulary["targets"])
+            decode_fn = smooth_decoder.decode_sequence
+        else:
+            decode_fn = lambda logits: common_layers.sample_with_temperature(logits, 0.0) # argmax decoding
+            
 
         with tf.variable_scope(modality.name, reuse=None):
             features["inputs"] = modality.bottom(inputs)
@@ -417,11 +428,11 @@ class LstmGAN(t2t_model.T2TModel):
 
         features["inputs"] = raw_inputs
 
-        return smoother_decoder.decode_sequence(logits), None
+        return decode_fn(logits), None
 
 
 @registry.register_hparams
-def transformer_gan_base():
+def lstm_gan_base():
     hparams = transformer_base_single_gpu()
     hparams.input_modalities = "inputs:symbol:GAN"
     hparams.target_modality = "symbol:GAN"
@@ -443,9 +454,9 @@ def transformer_gan_base():
     hparams.add_hparam("num_decode_steps", 0)
     hparams.add_hparam("discrim_grad_mul", 1e-9)
     hparams.add_hparam("step_interval", 1)
-    hparams.add_hparam("warmup_steps", 2150001)
-    hparams.add_hparam("mle_decay_period", 2150000)
-    hparams.add_hparam("embed_decay_period", 2150000)
+    hparams.add_hparam("warmup_steps", 22001)
+    hparams.add_hparam("mle_decay_period", 22000)
+    hparams.add_hparam("embed_decay_period", 22000)
     hparams.add_hparam("lipschitz_mult", 1500.0)
     hparams.add_hparam("fertility_cells", 2)
     hparams.add_hparam("z_temp", 0.05)
@@ -458,55 +469,17 @@ def transformer_gan_base():
 
 
 @registry.register_hparams
-def transformer_gan_base_ro():
-    hparams = transformer_gan_base()
-    hparams.embedding_file = None
-    hparams.z_temp = 0
-    hparams.fertility_filename = "translate_roen_wmt8k.alignfertility_model.pkl"
-    hparams.add_hparam("lang_model_file", "/root/code/t2t_data/lang_model_small.eng.pkl")
-    hparams.add_hparam("lang_model_data", "/root/code/t2t_data/t2t_datagen/ro-en-lang_data.txt")
-    return hparams
-
-
-@registry.register_hparams
-def transformer_gan_base_ro_reinforce():
-    hparams = transformer_gan_base_ro()
-    hparams.embedding_file = None
-    hparams.z_temp = 0
-    hparams.fertility_filename = None
-    return hparams
-
-
-@registry.register_hparams
-def transformer_gan_fat_ro_reinforce():
-    hparams = transformer_gan_base_ro_reinforce()
-    hparams.num_heads = 16
-    hparams.hidden_size = 1024
-    hparams.filter_size = 4096
-
-    return hparams
-
-
-@registry.register_hparams
-def transformer_gan_german():
-    hparams = transformer_gan_base()
+def lstm_gan_german():
+    hparams = lstm_gan_base()
     hparams.embedding_file = None
     hparams.z_temp = 0
     hparams.fertility_filename = None
     hparams.learning_rate = 1e-6
     hparams.reinforce_delta = 1e-1
-    hparams.add_hparam("lang_model_file", "/root/code/t2t_data/lang_model_small.germ.pkl")
+    hparams.add_hparam("lang_model_file",None)# "/root/code/t2t_data/lang_model_small.germ.pkl")
     hparams.add_hparam("lang_model_data", "/root/code/t2t_data/t2t_datagen/german_lang_model_data.txt")
     hparams.ganmode = "wgan-gp"
     return hparams
-
-
-@registry.register_hparams
-def transformer_gan_base_mini():
-    hparams = transformer_gan_base()
-    hparams.hidden_size = 128
-    return hparams
-
 
 def decay_gradient(outputs, decay_period, final_val=1.00, summarize=True):
     masking = common_layers.inverse_lin_decay(decay_period)
@@ -514,48 +487,3 @@ def decay_gradient(outputs, decay_period, final_val=1.00, summarize=True):
     if summarize:
         tf.summary.scalar("loss_mask", masking)
     return tf.stop_gradient(masking * outputs) + (1.0 - masking) * outputs
-
-
-@registry.register_symbol_modality("GAN")
-class GANSymbolModality(modalities.SymbolModality):
-    def _get_weights(self, hidden_dim=None):
-        if self._model_hparams.embedding_file is None:
-            initialiser = lambda name: tf.random_normal_initializer(0.0, hidden_dim ** -0.5)
-        else:
-            with open(self._model_hparams.embedding_file, "rb") as fp:
-                embeddings = pickle.load(fp)
-            tf.logging.info("Loading embeddings from file")
-            initialiser = lambda name: tf.constant(embeddings["symbol_modality_27927_512/shared/" + name + ":0"])
-
-        if hidden_dim is None:
-            hidden_dim = self._body_input_depth
-        num_shards = self._model_hparams.symbol_modality_num_shards
-        shards = []
-        for i in xrange(num_shards):
-            shard_size = (self._vocab_size // num_shards) + (
-                1 if i < self._vocab_size % num_shards else 0)
-            var_name = "weights_%d" % i
-            shards.append(
-                tf.get_variable(
-                    var_name,
-                    initializer=initialiser(var_name),
-                    shape=None if self._model_hparams.embedding_file is not None else [shard_size, hidden_dim]))
-        if num_shards == 1:
-            ret = shards[0]
-        else:
-            ret = tf.concat(shards, 0)
-        ret = eu.convert_gradient_to_tensor(ret)
-
-        if type(ret) == list:
-            weights = [decay_gradient(w, self._model_hparams.embed_decay_period, summarize=False) for w in ret]
-        else:
-            weights = decay_gradient(ret, self._model_hparams.embed_decay_period, summarize=False)
-        return weights
-
-    #    @property
-    #    def targets_weights_fn(self):
-    #        return common_layers.weights_all
-
-    def loss(self, *args, **kwargs):
-        loss, weights = super(GANSymbolModality, self).loss(*args, **kwargs)
-        return decay_gradient(loss, self._model_hparams.mle_decay_period, summarize=False), weights

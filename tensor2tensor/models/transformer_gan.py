@@ -179,25 +179,29 @@ class TransformerGAN(Transformer):
 
             encoder_output, encoder_decoder_attention_bias = self.encode(inputs, target_space, hparams)
 
-        if fert_filename is not None:
-            tf.logging.info("Loading Fertility Model")
-            fert_model = FertilityModel(fert_filename,
-                                        self._hparams.reinforce_delta if self._hparams.mode == tf.estimator.ModeKeys.TRAIN else 0.0)
-            features["inputs_fert_raw"], fertilities = tf.py_func(fert_model.fertilize, [features["inputs_raw"]],
-                                                                  [tf.int32, tf.int32])
-            features["inputs_fert_raw"] = tf.reshape(features["inputs_fert_raw"], tf.shape(features["inputs_raw"]))
+        if features.get("inputs_fert_raw", None) is None:
+            if fert_filename is not None:
+                tf.logging.info("Loading Fertility Model")
+                fert_model = FertilityModel(fert_filename,
+                                            self._hparams.reinforce_delta if self._hparams.mode == tf.estimator.ModeKeys.TRAIN else 0.0)
+                features["inputs_fert_raw"], fertilities = tf.py_func(fert_model.fertilize, [features["inputs_raw"]],
+                                                                      [tf.int32, tf.int32])
+                features["inputs_fert_raw"] = tf.reshape(features["inputs_fert_raw"], tf.shape(features["inputs_raw"]))
+                
+                def reinforce(reward):
+                    return tf.py_func(fert_model.reinforce, [features["inputs_raw"], fertilities, reward], tf.int64)
 
-            def reinforce(reward):
-                return tf.py_func(fert_model.reinforce, [features["inputs_raw"], fertilities, reward], tf.int64)
-
+            else:
+                tf.logging.info("Using DQN fertility model")
+                fert_model = DQNFertility(max_fertility=5, hparams=self._hparams)
+                features["inputs_fert_raw"], fertilities = fert_model.fertilise(inputs, features["inputs_raw"])
+                features["inputs_fert_raw"] = tf.reshape(features["inputs_fert_raw"], tf.shape(features["inputs_raw"]))
+                
+                def reinforce(reward):
+                    return fert_model.reinforce_op(fertilities, reward)
         else:
-            tf.logging.info("Using DQN fertility model")
-            fert_model = DQNFertility(max_fertility=5, hparams=self._hparams)
-            features["inputs_fert_raw"], fertilities = fert_model.fertilise(inputs, features["inputs_raw"])
-            features["inputs_fert_raw"] = tf.reshape(features["inputs_fert_raw"], tf.shape(features["inputs_raw"]))
-
             def reinforce(reward):
-                return fert_model.reinforce_op(fertilities, reward)
+                return tf.constant(0.0)
 
         with tf.variable_scope(tf.VariableScope(True)):
             with tf.variable_scope(target_modality.name, reuse=True):
@@ -281,7 +285,7 @@ class TransformerGAN(Transformer):
             "semantic_reg": d_loss_cycle * 150,
             "reinforce_fert": tf.reduce_mean(reinforce(d_fake * hparams.reinforce_delta))
         }
-        if self._hparams.mode == tf.estimator.ModeKeys.PREDICT:
+        if self._hparams.mode in [tf.estimator.ModeKeys.PREDICT, tf.estimator.ModeKeys.EVAL]:
             return decode_out, d_fake
 
         return decode_out, losses
@@ -290,6 +294,24 @@ class TransformerGAN(Transformer):
         features["inputs"], features["targets"] = common_layers.pad_to_same_length(features["inputs"],
                                                                                    features["targets"])
         return super(TransformerGAN, self).model_fn(features, **kwargs)
+
+    def eval_autoregressive(self,
+                            features=None,
+                            decode_length=50):
+        raw_targets = features["targets"]
+        if self._hparams.ar_beams == 1:
+            return super().eval_autoregressive(features, decode_length)
+        
+        vocab_sz = self._problem_hparams.target_modality._vocab_size
+        ids = self._fast_decode(features, decode_length,
+                                beam_size=self._hparams.ar_beams,
+                                top_beams=1,
+                                alpha=self._hparams.ar_alpha)[0]
+        
+        fake_logits = tf.one_hot(ids, vocab_sz)
+        print(fake_logits)
+        features["targets"] = raw_targets
+        return fake_logits, dict()
 
     def _fast_decode(self,
                      features,
@@ -315,6 +337,7 @@ class TransformerGAN(Transformer):
         Raises:
             NotImplementedError: If there are multiple data shards.
         """
+        beam_size = 1
         raw_inputs = features["inputs"]
         batch_sz = tf.shape(raw_inputs)[0]
 
@@ -330,6 +353,8 @@ class TransformerGAN(Transformer):
         inputs = tf.reshape(inputs, [s[0] * s[1], s[2], s[3], s[4]])
         features["inputs_raw"] = inputs
 
+        features["inputs_fert_raw"] = self.fertilise(features["inputs_raw"])
+        
         batch_size = tf.shape(inputs)[0]
         decode_length = tf.shape(inputs)[1] + decode_length
         initial_ids = tf.zeros([batch_size, decode_length, 1, modality._body_input_depth], dtype=tf.float32)
@@ -351,12 +376,13 @@ class TransformerGAN(Transformer):
             losses = tf.reshape(losses, tf.concat([[beam_size, batch_sz], tf.shape(losses)[1:]], axis=0))
 
         top_for_each_batch = tf.squeeze(tf.argmax(losses, 0, output_type=tf.int32), [-1])
-
         indices = tf.transpose(tf.stack([top_for_each_batch, tf.range(batch_sz)]))
         gathered = tf.gather_nd(feats, indices)
+
+        gathered = tf.reduce_mean(feats, 0)
         body_out = tf.reshape(gathered, tf.shape(feats)[1:]), None
 
-        body_out = tf.Print(body_out[0], [body_out[0]]), None
+        body_out = body_out[0], None
         with tf.variable_scope(modality.name, reuse=None):
             logits = modality.top(*body_out)
 
@@ -364,6 +390,25 @@ class TransformerGAN(Transformer):
 
         return smoother_decoder.decode_sequence(logits), None
 
+    def pyfunc_remap(self, inputs):
+        outputs = np.zeros_like(inputs)
+        inputs_squeezed = np.squeeze(inputs, axis=(2, 3))
+        sampled_fertilites = np.random.randint(0,4,inputs_squeezed.shape)
+        fertilities = np.zeros_like(inputs_squeezed)
+        for batch_id, sentence in enumerate(inputs_squeezed):
+            current_idx = 0
+            for token_idx, token in enumerate(sentence):
+                if batch_id == 0:
+                    fertility = sampled_fertilites[batch_id, token_idx]
+                outputs[batch_id, current_idx:current_idx + fertility, 0, 0] = token
+                current_idx += fertility
+                fertilities[batch_id, token_idx] = fertility
+        return outputs
+                
+    def fertilise(self, inputs):
+        outputs = tf.py_func(self.pyfunc_remap, [inputs], [tf.int32])
+        outputs = tf.reshape(outputs, tf.shape(inputs))
+        return outputs
 
 @registry.register_hparams
 def transformer_gan_base():
@@ -409,8 +454,8 @@ def transformer_gan_base_ro():
     hparams.embedding_file = None
     hparams.z_temp = 0
     hparams.fertility_filename = "translate_roen_wmt8k.alignfertility_model.pkl"
-    hparams.add_hparam("lang_model_file", "/root/code/t2t_data/lang_model_small.eng.pkl")
-    hparams.add_hparam("lang_model_data", "/root/code/t2t_data/t2t_datagen/ro-en-lang_data.txt")
+    hparams.add_hparam("lang_model_file", "/root/code/t2t_data/lang_model_large.eng.pkl")
+    hparams.add_hparam("lang_model_data", "/root/code/t2t_data/t2t_datagen/ro-en-lang_data_large.txt")
     return hparams
 
 

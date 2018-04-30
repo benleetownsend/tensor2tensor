@@ -17,13 +17,13 @@ def beam_is_finished(beam):
 def calc_len_pen(beams, alpha, close_beams=False):
     len_pen = np.ones(len(beams))
     for bi, beam in enumerate(beams):
-        length = len(set(beam))
-        len_pen[bi] = ((5.0 + length + (1.0 if close_beams or beam_is_finished(beam) else 2.0))/6.0)**(alpha or 0.0)
+        length = len([elem for i, elem in enumerate(beam) if i == 0 or beam[i-1] != elem])
+        len_pen[bi] = ((length + (1.0 if close_beams or beam_is_finished(beam) else 2.0)))**(alpha or 0.0)
         if len(beam) == 0 and close_beams:
             len_pen[bi] = epsilon
     return len_pen
 
-def biased_beam_search_decoder(logits, predict_next, beam_size, alpha=5.7):
+def biased_beam_search_decoder(logits, predict_next, beam_size, alpha=1.7):
     print("Decoding Sequence")
     beams = [[]]
     log_probs = np.zeros(len(beams)) - 0.1 # to cater for the empty case.
@@ -121,6 +121,7 @@ class SmoothOutput:
 
     def decode_sequence(self, logits):
         log_probs = tf.nn.log_softmax(logits)
+        print(log_probs)
         output = tf.py_func(self.decode_sequence_py, [log_probs], [tf.int32])
         return tf.reshape(output, tf.shape(log_probs)[:-1])
             
