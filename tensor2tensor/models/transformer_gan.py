@@ -110,7 +110,7 @@ class TransformerGAN(Transformer):
 
     # If regular WGAN, apply weight clipping to the critic values
     if hparams.ganmode == "wgan":
-      clip_ops = clip_op()
+      clip_ops = clip_op("discriminator")
       with tf.control_dependencies(clip_ops):
         d_loss = tf.identity(d_loss)
 
