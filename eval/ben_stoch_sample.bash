@@ -16,7 +16,7 @@ model_dir="../../t2t_train/final_run_romanian/final_first_romanian_fat/"
 
 t2t-decoder   --data_dir=${data_dir}   --problems=${problem}   \
 	      --model=transformer_gan   --hparams_set=${hparams}   \
-	      --output_dir=checkpoints/  --decode_hparams="beam_size=$BEAM_SIZE"\
+	      --output_dir=${model_dir}  --decode_hparams="beam_size=$BEAM_SIZE"\
 	      --decode_interactive
 #	      --decode_from_file=${input_file}.src.${lang1}\
 #	      --decode_to_file=${input_file}.trans.${lang2}

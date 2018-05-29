@@ -68,6 +68,13 @@ class TransformerGAN(Transformer):
     decode_out = self.decode(decoder_input, encoder_output,
                              encoder_decoder_attention_bias,
                              tf.ones_like(decoder_self_attention_bias), hparams)
+    for j in range(hparams.extra_step):
+      with tf.variable_scope("extra_steps", reuse=j!=0):
+        decode_out = common_layers.flatten4d3d(decode_out)
+        decode_out = common_attention.add_timing_signal_1d(decode_out)
+        decode_out = self.decode(decode_out, encoder_output,
+                               encoder_decoder_attention_bias,
+                               tf.ones_like(decoder_self_attention_bias), hparams)
 
     # Get the embeddings from the modality
     with tf.variable_scope(tf.VariableScope(True)):
@@ -119,7 +126,8 @@ class TransformerGAN(Transformer):
       "lipschitz-penalty": gradient_penalty,
       "trans_embed_loss": trans_embed_loss,
       "semantic_reg": d_loss_cycle * 150,
-      "reinforce_fert": tf.reduce_mean(reinforce(d_fake * hparams.reinforce_delta))
+      "reinforce_fert": tf.reduce_mean(reinforce(d_fake * hparams.reinforce_delta)),
+      "d_fake": tf.stop_gradient(d_fake)
     }
 
     return decode_out, losses
@@ -203,9 +211,9 @@ class TransformerGAN(Transformer):
 
     with tf.variable_scope("body", reuse=None):
       feats, losses = self.model_fn_body(features)
-      d_loss = losses["discriminator"]
+      d_loss = losses["d_fake"]
       feats = tf.reshape(feats, tf.concat([[beam_size, batch_sz], tf.shape(feats)[1:]], axis=0))
-      d_loss = tf.reshape(losses, tf.concat([[beam_size, batch_sz], tf.shape(d_loss)[1:]], axis=0))
+      d_loss = tf.reshape(d_loss, tf.concat([[beam_size, batch_sz], tf.shape(d_loss)[1:]], axis=0))
 
     top_for_each_batch = tf.squeeze(tf.argmax(d_loss, 0, output_type=tf.int32), [-1])
     indices = tf.transpose(tf.stack([top_for_each_batch, tf.range(batch_sz)]))
@@ -258,6 +266,7 @@ def transformer_gan_base():
   hparams.add_hparam("reinforce_delta", 1e-7)
   hparams.add_hparam("embedding_file", "embeddings.pkl")
   hparams.add_hparam("fertility_filename", "ENG_FR.alignfertility_model.pkl")
+  hparams.add_hparam("extra_step", 0)
   return hparams
 
 
@@ -300,7 +309,10 @@ def transformer_gan_german():
   hparams.reinforce_delta = 1e-1
   hparams.add_hparam("lang_model_file", "/root/code/t2t_data/lang_model_small.germ.pkl")
   hparams.add_hparam("lang_model_data", "/root/code/t2t_data/t2t_datagen/german_lang_model_data.txt")
+  hparams.lang_model_file = None
   hparams.ganmode = "wgan-gp"
+  hparams.extra_step = 5
+  hparams.batch_size = 1024//4
   return hparams
 
 
